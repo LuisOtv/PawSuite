@@ -364,34 +364,18 @@ impl PawCutApp {
                 (Panel::Inspector, Icon::Inspector, "Inspector"),
             ] {
                 let on = self.layout.is_visible(panel);
-                if icons::button(ui, icon, 15.0, on, label).clicked() {
+                if icons::button_labeled(ui, icon, 15.0, on, label, "").clicked() {
                     self.toggle_panel(panel);
                 }
-                let text = egui::RichText::new(label).size(11.5).color(if on {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_DIM
-                });
-                // o nome ao lado do ícone também liga e desliga o painel
-                if ui
-                    .add(egui::Label::new(text).sense(egui::Sense::click()))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    self.toggle_panel(panel);
-                }
-                ui.add_space(10.0);
+                ui.add_space(2.0);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Deliver: abre a janela de exportação (fecha se não estiver exportando).
                 let open = self.ws.deliver.is_some();
                 let tip = self.ws.tip("Exportar o vídeo", Action::Deliver);
-                ui.label(egui::RichText::new("Deliver").size(11.5).color(if open {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_DIM
-                }));
-                if icons::button(ui, Icon::DeliverPage, 15.0, open, &tip).clicked() {
+                if icons::button_labeled(ui, Icon::DeliverPage, 15.0, open, "Deliver", &tip)
+                    .clicked()
+                {
                     if !open {
                         self.ws.open_deliver();
                     } else if !self.ws.deliver.as_ref().is_some_and(|d| d.job.is_some()) {
