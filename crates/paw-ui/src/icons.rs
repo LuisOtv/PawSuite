@@ -1063,7 +1063,8 @@ pub fn button_labeled(
     } else if resp.hovered() {
         Some(theme::BAR_LIGHT)
     } else {
-        None
+        // repouso: uma placa discreta, para o botão inteiro ser visível mesmo desligado
+        Some(theme::BAR_LIGHT.gamma_multiply(0.8))
     };
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 4.0, bg);
