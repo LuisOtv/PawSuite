@@ -364,7 +364,7 @@ impl PawCutApp {
                 (Panel::Inspector, Icon::Inspector, "Inspector"),
             ] {
                 let on = self.layout.is_visible(panel);
-                if icons::button_labeled(ui, icon, 15.0, on, label, "").clicked() {
+                if icons::button(ui, icon, 15.0, on, label).clicked() {
                     self.toggle_panel(panel);
                 }
                 ui.add_space(2.0);
@@ -373,9 +373,7 @@ impl PawCutApp {
                 // Deliver: abre a janela de exportação (fecha se não estiver exportando).
                 let open = self.ws.deliver.is_some();
                 let tip = self.ws.tip("Exportar o vídeo", Action::Deliver);
-                if icons::button_labeled(ui, Icon::DeliverPage, 15.0, open, "Deliver", &tip)
-                    .clicked()
-                {
+                if icons::button(ui, Icon::DeliverPage, 15.0, open, &tip).clicked() {
                     if !open {
                         self.ws.open_deliver();
                     } else if !self.ws.deliver.as_ref().is_some_and(|d| d.job.is_some()) {

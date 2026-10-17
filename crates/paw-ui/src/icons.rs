@@ -8,7 +8,7 @@
 
 use std::f32::consts::{PI, TAU};
 
-use egui::{Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2};
+use egui::{Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, vec2};
 
 use crate::theme;
 
@@ -1032,67 +1032,6 @@ pub fn button(ui: &mut Ui, icon: Icon, size: f32, on: bool, tip: &str) -> Respon
         icon,
         color,
     );
-    if tip.is_empty() {
-        resp
-    } else {
-        resp.on_hover_text(tip)
-    }
-}
-
-/// Botão com ícone e nome juntos, numa peça só (fundo e destaque cobrem os dois).
-pub fn button_labeled(
-    ui: &mut Ui,
-    icon: Icon,
-    size: f32,
-    on: bool,
-    label: &str,
-    tip: &str,
-) -> Response {
-    let font = egui::FontId::proportional(11.5);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font, Color32::WHITE);
-    let (pad, gap) = (4.0, 6.0);
-    let w = pad + size + gap + galley.size().x + pad + 2.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, size + 8.0), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
-    let bg = if on {
-        Some(theme::ACCENT.gamma_multiply(0.22))
-    } else if resp.is_pointer_button_down_on() {
-        Some(theme::BAR_LIGHT.gamma_multiply(1.3))
-    } else if resp.hovered() {
-        Some(theme::BAR_LIGHT)
-    } else {
-        // repouso: uma placa discreta, para o botão inteiro ser visível mesmo desligado
-        Some(theme::BAR_LIGHT.gamma_multiply(0.8))
-    };
-    if let Some(bg) = bg {
-        ui.painter().rect_filled(rect, 4.0, bg);
-    }
-    let (icon_color, text_color) = if !ui.is_enabled() {
-        let c = theme::TEXT_DIM.gamma_multiply(0.6);
-        (c, c)
-    } else if on {
-        (theme::ACCENT, theme::TEXT)
-    } else if resp.hovered() {
-        (Color32::WHITE, Color32::WHITE)
-    } else {
-        (theme::TEXT, theme::TEXT_DIM)
-    };
-    let icon_rect = Rect::from_min_size(
-        rect.left_center() + vec2(pad, -size / 2.0),
-        vec2(size, size),
-    );
-    paint(ui.painter(), icon_rect, icon, icon_color);
-    ui.painter().galley(
-        pos2(
-            icon_rect.right() + gap,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        text_color,
-    );
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if tip.is_empty() {
         resp
     } else {
