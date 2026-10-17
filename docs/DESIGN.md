@@ -235,6 +235,9 @@ Blender:
   texto que faz a mesma coisa é bug: vira um só, o ícone, e o clique faz a ação (foi o caso da
   engrenagem solta ao lado de "Configuração de áudio"). Texto só quando não existe ícone claro
   ou a ação precisa de uma palavra para não ser confundida.
+- **Foto de tela não mexe nos arquivos de quem usa.** Rodar o app com `PAWxxx_SCREENSHOT` já
+  isola configuração, layout e autosave numa pasta temporária (`paw_ui::isolate_screenshot_run`).
+  Antes, uma foto de teste regravava o layout dos dockers de verdade.
 - **Feedback imediato.** Todo clique tem resposta na mesma tela (< 100 ms). Se a operação é
   mais lenta, mostre progresso e permita cancelar.
 

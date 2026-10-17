@@ -8,6 +8,7 @@ mod state;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
+    paw_ui::isolate_screenshot_run("PAWPAINT_SCREENSHOT");
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

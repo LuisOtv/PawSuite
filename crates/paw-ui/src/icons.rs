@@ -105,6 +105,8 @@ pub enum Icon {
     /// Marcar entrada / saída (colchetes).
     MarkIn,
     MarkOut,
+    /// Máscara de camada (quadrado com círculo).
+    Mask,
 }
 
 impl Icon {
@@ -197,6 +199,7 @@ impl Icon {
         Icon::Check,
         Icon::MarkIn,
         Icon::MarkOut,
+        Icon::Mask,
     ];
 }
 
@@ -865,6 +868,10 @@ pub fn paint(painter: &Painter, r: Rect, icon: Icon, c: Color32) {
             if icon == Icon::ZoomIn {
                 pen.line(10.5, 7.5, 10.5, 13.5);
             }
+        }
+        Icon::Mask => {
+            pen.rect(3.5, 3.5, 17.0, 17.0, 2.0);
+            pen.circle(12.0, 12.0, 5.0);
         }
         Icon::MarkIn | Icon::MarkOut => {
             // colchete com uma setinha apontando para dentro

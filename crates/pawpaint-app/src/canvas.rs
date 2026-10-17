@@ -784,10 +784,14 @@ fn doc_tabs(st: &mut State, ui: &mut egui::Ui) {
                     if ui.selectable_label(selected, d.title()).clicked() {
                         select = Some(i);
                     }
-                    if ui
-                        .add(egui::Button::new("×").frame(false).small())
-                        .on_hover_text("Fechar o documento")
-                        .clicked()
+                    if paw_ui::icons::button(
+                        ui,
+                        paw_ui::icons::Icon::Close,
+                        11.0,
+                        false,
+                        "Fechar o documento",
+                    )
+                    .clicked()
                     {
                         close = Some(i);
                     }

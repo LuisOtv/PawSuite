@@ -3989,15 +3989,7 @@ impl VoiceApp {
         in_row(ui, row(0), &mut |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.set_max_width(x1 - x0 - 24.0);
-            if ui
-                .add(
-                    egui::Button::new("×")
-                        .frame(false)
-                        .min_size(vec2(16.0, ROW)),
-                )
-                .on_hover_text("Apagar a faixa")
-                .clicked()
-            {
+            if icons::button(ui, Icon::Close, 12.0, false, "Apagar a faixa").clicked() {
                 remove = true;
             }
             if let Some((rid, text)) = &mut self.renaming
@@ -4223,13 +4215,7 @@ impl VoiceApp {
                 |ui| {
                     ui.set_clip_rect(visible);
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    if ui
-                        .add(
-                            egui::Button::new("×")
-                                .frame(false)
-                                .min_size(vec2(16.0, 22.0)),
-                        )
-                        .on_hover_text("Apagar a faixa de rótulos")
+                    if icons::button(ui, Icon::Close, 12.0, false, "Apagar a faixa de rótulos")
                         .clicked()
                     {
                         remove = true;
@@ -4673,10 +4659,7 @@ impl VoiceApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Roteiro").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("×")
-                    .on_hover_text("Esconder (Ver → Roteiro)")
-                    .clicked()
+                if icons::button(ui, Icon::Close, 12.0, false, "Esconder (Ver → Roteiro)").clicked()
                 {
                     self.show_script = false;
                 }

@@ -33,3 +33,17 @@ pub fn low_latency_wgpu() -> eframe::egui_wgpu::WgpuConfiguration {
         ..Default::default()
     }
 }
+
+/// Para os testes visuais (`PAWxxx_SCREENSHOT=…`): manda configuração, layout e autosave para uma
+/// pasta temporária, assim rodar o app só para tirar uma foto nunca mexe nos arquivos de verdade
+/// de quem usa. Chame no começo do `main`, antes de qualquer thread.
+pub fn isolate_screenshot_run(screenshot_var: &str) {
+    if std::env::var_os(screenshot_var).is_none() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("{}-isolated", screenshot_var.to_lowercase()));
+    for var in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] {
+        // SAFETY: roda no início do `main`, antes de existir outra thread.
+        unsafe { std::env::set_var(var, dir.join(var)) };
+    }
+}

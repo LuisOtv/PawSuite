@@ -268,19 +268,25 @@ pub fn layers(st: &mut State, ui: &mut egui::Ui) {
             {
                 st.docs[cur].edit_mask = on;
             }
-            if ui
-                .small_button("Aplicar")
-                .on_hover_text("Passa o que está escondido para os pixels")
-                .clicked()
+            if paw_ui::icons::button(
+                ui,
+                Icon::Check,
+                14.0,
+                false,
+                "Aplicar a máscara: passa o que está escondido para os pixels",
+            )
+            .clicked()
             {
                 let _ = st.docs[cur].ed.remove_mask(active, true);
                 st.docs[cur].edit_mask = false;
             }
-            if ui.small_button("Apagar máscara").clicked() {
+            if paw_ui::icons::button(ui, Icon::Trash, 14.0, false, "Apagar a máscara").clicked() {
                 let _ = st.docs[cur].ed.remove_mask(active, false);
                 st.docs[cur].edit_mask = false;
             }
-        } else if ui.button("+ Máscara").clicked() {
+        } else if paw_ui::icons::button(ui, Icon::Mask, 14.0, false, "Adicionar máscara à camada")
+            .clicked()
+        {
             let _ = st.docs[cur].ed.add_mask(active);
             st.docs[cur].edit_mask = true;
         }

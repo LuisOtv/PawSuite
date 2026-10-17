@@ -507,7 +507,16 @@ impl Workspace {
                 "",
                 |ui| {
                     if ui
-                        .add_enabled(!list.is_empty(), egui::Button::new("Tirar todos"))
+                        .add_enabled_ui(!list.is_empty(), |ui| {
+                            paw_ui::icons::button(
+                                ui,
+                                paw_ui::icons::Icon::Trash,
+                                14.0,
+                                false,
+                                "Tirar todos os efeitos de áudio do clipe",
+                            )
+                        })
+                        .inner
                         .clicked()
                     {
                         list.clear();
@@ -1193,7 +1202,14 @@ impl Workspace {
                             "",
                         );
                         if first.color != ColorAdjust::default()
-                            && ui.small_button("Resetar cor").clicked()
+                            && paw_ui::icons::button(
+                                ui,
+                                paw_ui::icons::Icon::Reset,
+                                14.0,
+                                false,
+                                "Resetar a cor do clipe",
+                            )
+                            .clicked()
                         {
                             self.apply_all(&clips, "insp-color-reset", |c| {
                                 Some(Edit::SetClip {
@@ -1652,14 +1668,26 @@ impl Workspace {
                             ui,
                             "",
                             |ui| {
-                                if ui
-                                    .button("Aplicar")
-                                    .on_hover_text("Põe esta aparência nos clipes selecionados")
-                                    .clicked()
+                                if paw_ui::icons::button(
+                                    ui,
+                                    paw_ui::icons::Icon::Check,
+                                    14.0,
+                                    false,
+                                    "Aplicar: põe esta aparência nos clipes selecionados",
+                                )
+                                .clicked()
                                 {
                                     self.apply_preset(pick);
                                 }
-                                if ui.button("Apagar").clicked() {
+                                if paw_ui::icons::button(
+                                    ui,
+                                    paw_ui::icons::Icon::Trash,
+                                    14.0,
+                                    false,
+                                    "Apagar este preset",
+                                )
+                                .clicked()
+                                {
                                     self.delete_preset(pick);
                                 }
                             },

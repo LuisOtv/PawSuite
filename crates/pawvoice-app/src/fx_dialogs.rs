@@ -631,9 +631,7 @@ fn eq_ui(ui: &mut Ui, bands: &mut Vec<EqBand>, rate: u32) {
                         .prefix("Q "),
                 );
             });
-            if ui
-                .small_button("×")
-                .on_hover_text("Tirar a banda")
+            if paw_ui::icons::button(ui, paw_ui::icons::Icon::Close, 12.0, false, "Tirar a banda")
                 .clicked()
             {
                 remove = Some(i);
