@@ -28,6 +28,10 @@ pub fn keymap_path() -> PathBuf {
     config_dir().join("keymap.json")
 }
 
+pub fn presets_path() -> PathBuf {
+    config_dir().join("presets.json")
+}
+
 pub fn layout_path() -> PathBuf {
     config_dir().join("layout-v3.json")
 }

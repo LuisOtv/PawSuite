@@ -17,6 +17,7 @@ paw-audio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image.workspace = true
+rustfft = "6"
 eframe = "0.36"
 egui = { version = "0.36", features = ["serde"] }
 egui_dock = { version = "0.21", features = ["serde"] }

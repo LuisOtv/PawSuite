@@ -7,3 +7,6 @@ edition.workspace = true
 libpulse-binding = "2.30"
 libpulse-simple-binding = "2.29"
 rustfft = "6"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -903,3 +903,131 @@ fn middle_button_wheel_runs_the_action_in_the_dragged_direction() {
         assert!(crate::keymap::radial_action(&a.id).is_some(), "{}", a.id);
     }
 }
+
+#[test]
+fn appearance_presets_save_apply_and_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("presets.json");
+    let mut st = AppState::new(Project::new(ProjectSettings::default()));
+    st.drop_generator(Generator::SolidColor, 0, 0);
+    st.drop_generator(Generator::SolidColor, 0, 300);
+    let (a, b) = (
+        st.project().video_tracks[0].clips[0].id,
+        st.project().video_tracks[0].clips[1].id,
+    );
+    // o primeiro clipe ganha uma cor e um volume; o segundo fica neutro
+    st.apply(Edit::SetClip {
+        clip: a,
+        change: ClipChange::Color(ColorAdjust {
+            hue: 30.0,
+            saturation: 40.0,
+            lightness: 0.0,
+        }),
+    });
+    let ctx = egui::Context::default();
+    let mut ws = Workspace::new(&ctx, st);
+    ws.recovery.clear();
+    ws.presets_path = Some(path.clone());
+    let clip_a = ws.st.project().clip(a).unwrap().clone();
+    ws.save_preset("  ", &clip_a);
+    assert!(ws.presets.is_empty(), "nome vazio não salva");
+    ws.save_preset("Look quente", &clip_a);
+    assert_eq!(ws.presets.len(), 1);
+    // aplica nos dois selecionados (a já tem; b ganha)
+    ws.st.selection = vec![b];
+    ws.apply_preset(0);
+    assert_eq!(ws.st.project().clip(b).unwrap().color.saturation, 40.0);
+    ws.st.undo();
+    assert_eq!(
+        ws.st.project().clip(b).unwrap().color.saturation,
+        0.0,
+        "um desfazer"
+    );
+    // vai para o disco e volta
+    assert_eq!(crate::presets::load(&path).len(), 1);
+    ws.delete_preset(0);
+    assert!(crate::presets::load(&path).is_empty());
+    // preset que não existe e seleção vazia não quebram
+    ws.apply_preset(7);
+    ws.st.selection.clear();
+    ws.save_preset("x", &clip_a);
+    ws.apply_preset(0);
+}
+
+#[test]
+fn transcription_result_becomes_subtitles_after_the_clip_start() {
+    let mut st = AppState::new(Project::new(ProjectSettings::default()));
+    st.drop_generator(Generator::SolidColor, 0, 0);
+    let ctx = egui::Context::default();
+    let mut ws = Workspace::new(&ctx, st);
+    ws.recovery.clear();
+    // o clipe começa no frame 60 (2 s a 30 fps): a fala de 0 a 1,5 s do SRT cai em 60..105
+    let srt = "1\n00:00:00,000 --> 00:00:01,500\nOlá, mundo\n\n2\n00:00:02,000 --> 00:00:03,000\nSegunda fala\n\n";
+    ws.finish_transcription(srt, 60);
+    let subs = ws.st.project().video_tracks.last().unwrap();
+    assert_eq!(subs.clips.len(), 2);
+    let fps = ws.st.project().settings.fps;
+    assert_eq!(subs.clips[0].start, 60);
+    assert_eq!(subs.clips[0].end(), 60 + fps.seconds_to_frames(1.5));
+    assert!(matches!(&subs.clips[0].source, ClipSource::Text(t) if t.text.contains("Olá")));
+    // lixo no lugar do SRT avisa e não cria faixa
+    let before = ws.st.project().video_tracks.len();
+    ws.finish_transcription("isto não é legenda", 0);
+    assert_eq!(ws.st.project().video_tracks.len(), before);
+    // sem whisper instalado a ação avisa (e não trava): selecionando um clipe sem áudio também
+    ws.start_transcription("pt");
+    assert!(ws.transcription.is_none());
+}
+
+#[test]
+fn stabilizing_a_shaky_clip_adds_position_keyframes_and_a_zoom() {
+    let dir = tempfile::tempdir().unwrap();
+    let video = paw_testkit::shaky_video(dir.path(), 3);
+    let mut st = AppState::new(Project::new(ProjectSettings::default()));
+    assert_eq!(st.import(&[video]), 1);
+    let m = st.project().media[0].id;
+    st.drop_media(m, TrackKind::Video, 0, 0);
+    let clip = st.project().video_tracks[0].clips[0].id;
+    st.select(clip, false);
+    let ctx = egui::Context::default();
+    let mut ws = Workspace::new(&ctx, st);
+    ws.recovery.clear();
+    ws.start_stabilization();
+    assert!(ws.stabilizing.is_some());
+    // já rodando: pedir de novo só avisa
+    ws.start_stabilization();
+    let start = std::time::Instant::now();
+    while ws.stabilizing.is_some() {
+        ws.begin_frame(&ctx);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "não terminou"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let c = ws.st.project().clip(clip).unwrap().clone();
+    let xs = c.keyframes.get(&Param::X).expect("keyframes de X");
+    assert!(xs.len() > 20, "{}", xs.len());
+    assert!(c.keyframes.contains_key(&Param::Y));
+    assert!(
+        c.transform.scale > 1.0,
+        "zoom para esconder as bordas: {}",
+        c.transform.scale
+    );
+    // um desfazer tira tudo
+    ws.st.undo();
+    let c = ws.st.project().clip(clip).unwrap();
+    assert!(c.keyframes.get(&Param::X).is_none_or(|k| k.is_empty()));
+    assert_eq!(c.transform.scale, 1.0);
+    // clipe com velocidade mudada: avisa e não roda
+    ws.st.apply(Edit::SetSpeed {
+        clips: vec![clip],
+        speed: 2.0,
+    });
+    ws.start_stabilization();
+    assert!(ws.stabilizing.is_none());
+    // nada selecionado: avisa
+    ws.st.selection.clear();
+    ws.start_stabilization();
+    assert!(ws.stabilizing.is_none());
+}

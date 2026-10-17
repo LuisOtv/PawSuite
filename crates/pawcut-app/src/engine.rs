@@ -264,25 +264,27 @@ impl AudioPlayer {
 /// um clipe novo (colado, trocado de velocidade) fica mudo por um instante até chegar, em vez
 /// de travar o som de todos os outros.
 struct AudioLoader {
-    tx: Sender<(PathBuf, f64)>,
-    rx: Receiver<(PathBuf, f64, Option<Arc<paw_media::Pcm>>)>,
-    /// Pedidos em andamento ou que falharam (esses só voltam a ser tentados depois de `forget`).
-    asked: std::collections::HashSet<(PathBuf, u64)>,
+    tx: Sender<(PathBuf, f64, Vec<pawcut_core::AudioFx>)>,
+    rx: Receiver<(PathBuf, f64, u64, Option<Arc<paw_media::Pcm>>)>,
+    /// Pedidos em andamento ou que falharam (esses só voltam a ser tentados depois de `forget`):
+    /// arquivo, velocidade e a chave dos efeitos de áudio do clipe (0 = som original).
+    asked: std::collections::HashSet<(PathBuf, u64, u64)>,
 }
 
 impl AudioLoader {
     fn spawn(sample_rate: u32) -> Self {
-        let (tx, jobs) = channel::<(PathBuf, f64)>();
+        let (tx, jobs) = channel::<(PathBuf, f64, Vec<pawcut_core::AudioFx>)>();
         let (out, rx) = channel();
         thread::Builder::new()
             .name("pawcut-audio-load".into())
             .spawn(move || {
                 let cache = default_cache_dir();
-                while let Ok((path, speed)) = jobs.recv() {
+                while let Ok((path, speed, fx)) = jobs.recv() {
+                    let key = pawcut_core::audio_fx_key(&fx);
                     let pcm = load_audio(&path, sample_rate, speed, cache.as_deref())
                         .ok()
-                        .map(Arc::new);
-                    if out.send((path, speed, pcm)).is_err() {
+                        .map(|pcm| Arc::new(pawcut_render::process_audio_fx(pcm, &fx)));
+                    if out.send((path, speed, key, pcm)).is_err() {
                         break;
                     }
                 }
@@ -304,28 +306,33 @@ impl AudioLoader {
             let Some(m) = project.media(*id) else {
                 continue;
             };
-            let key = (m.info.path.clone(), clip.speed.to_bits());
+            let fx_key = pawcut_core::audio_fx_key(&clip.audio_fx);
+            let key = (m.info.path.clone(), clip.speed.to_bits(), fx_key);
             if !self.asked.contains(&key)
-                && media.resident_audio(&m.info.path, clip.speed).is_none()
+                && media
+                    .resident_audio_variant(&m.info.path, clip.speed, fx_key)
+                    .is_none()
             {
                 self.asked.insert(key);
-                let _ = self.tx.send((m.info.path.clone(), clip.speed));
+                let _ = self
+                    .tx
+                    .send((m.info.path.clone(), clip.speed, clip.audio_fx.clone()));
             }
         }
     }
 
     /// Entrega ao player o que ficou pronto.
     fn deliver(&mut self, media: &mut MediaLibrary) {
-        while let Ok((path, speed, pcm)) = self.rx.try_recv() {
+        while let Ok((path, speed, fx_key, pcm)) = self.rx.try_recv() {
             if let Some(pcm) = pcm {
-                media.insert_audio(&path, speed, pcm);
-                self.asked.remove(&(path, speed.to_bits()));
+                media.insert_audio_variant(&path, speed, fx_key, pcm);
+                self.asked.remove(&(path, speed.to_bits(), fx_key));
             }
         }
     }
 
     fn forget(&mut self, path: &Path) {
-        self.asked.retain(|(p, _)| p != path);
+        self.asked.retain(|(p, _, _)| p != path);
     }
 }
 
@@ -617,11 +624,30 @@ impl ExportJob {
                     s.sample_rate,
                     default_cache_dir(),
                 ));
-                let out = export(&project, &mut renderer, &settings, &c, |p| {
+                let gif = settings
+                    .output
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+                // GIF: exporta um vídeo temporário sem áudio e converte (paleta própria, melhor cor).
+                let mut real = settings.clone();
+                if gif {
+                    real.output = settings.output.with_extension("gif.tmp.mp4");
+                    real.audio_kbps = None;
+                }
+                let out = export(&project, &mut renderer, &real, &c, |p| {
                     m.store(p.stage == Stage::Audio, Ordering::Relaxed);
                     d.store(p.done, Ordering::Relaxed);
                     if p.done % 15 == 0 {
                         repaint();
+                    }
+                })
+                .and_then(|()| {
+                    if gif {
+                        let r = to_gif(&real.output, &settings.output);
+                        let _ = std::fs::remove_file(&real.output);
+                        r
+                    } else {
+                        Ok(())
                     }
                 });
                 let msg = match out {
@@ -646,6 +672,36 @@ impl ExportJob {
 
     pub fn finished(&self) -> Option<Result<(), String>> {
         self.result.lock().ok()?.clone()
+    }
+}
+
+/// Converte um vídeo em GIF com o `ffmpeg`: 15 quadros por segundo, até 480 px de largura e uma
+/// paleta calculada para o próprio vídeo.
+fn to_gif(video: &Path, gif: &Path) -> Result<(), ExportError> {
+    let filter = "fps=15,scale='min(480,iw)':-2:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5";
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(video)
+        .args(["-vf", filter, "-loop", "0"])
+        .arg(gif)
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ExportError::FfmpegMissing
+            } else {
+                ExportError::Io(e)
+            }
+        })?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(ExportError::Ffmpeg {
+            log: String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .last()
+                .unwrap_or("sem mensagem")
+                .to_string(),
+        })
     }
 }
 
@@ -684,6 +740,117 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(10), "nunca chegou");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// O player recebe o áudio já com os efeitos do clipe: o mesmo arquivo com e sem efeito dá
+    /// resultados diferentes e a troca de efeito faz o loader pedir o som novo.
+    #[test]
+    fn the_loader_delivers_audio_with_the_clip_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = paw_testkit::dc_audio(dir.path(), "a.wav", 0.5, 2.0);
+        let mut st = crate::state::AppState::new(Project::new(ProjectSettings::default()));
+        let info = paw_media::probe(&wav, ProjectSettings::default().fps).unwrap();
+        let m = st
+            .apply(pawcut_core::Edit::AddMedia(info))
+            .unwrap()
+            .media
+            .unwrap();
+        st.drop_media(m, pawcut_core::TrackKind::Audio, 0, 0);
+        let clip = st.project().audio_tracks[0].clips[0].id;
+        st.apply(pawcut_core::Edit::SetClip {
+            clip,
+            change: pawcut_core::ClipChange::AudioFx(vec![pawcut_core::AudioFx::HighPass {
+                hz: 200.0,
+            }]),
+        });
+        let project = st.project().clone();
+        let mut renderer = Renderer::new(MediaLibrary::new((2, 2), 48_000, None));
+        let mut loader = AudioLoader::spawn(48_000);
+        loader.request_missing(&project, renderer.media());
+        let fx_key = pawcut_core::audio_fx_key(&project.audio_tracks[0].clips[0].audio_fx);
+        let path = wav.clone();
+        let start = std::time::Instant::now();
+        while renderer
+            .media()
+            .resident_audio_variant(&path, 1.0, fx_key)
+            .is_none()
+        {
+            loader.deliver(renderer.media());
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "o som com efeito nunca chegou"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let out = renderer.mix_audio_resident(&project, 40_000, 8);
+        assert_eq!(out.len(), 16);
+        // O nível constante de 0,5 some no passa-altas (o som original aqui seria 0,5).
+        assert!(out.iter().all(|v| v.abs() < 0.05), "{out:?}");
+        // Tirando o efeito, o loader pede o original e o som volta.
+        st.apply(pawcut_core::Edit::SetClip {
+            clip,
+            change: pawcut_core::ClipChange::AudioFx(Vec::new()),
+        });
+        let project = st.project().clone();
+        loader.request_missing(&project, renderer.media());
+        let start = std::time::Instant::now();
+        loop {
+            loader.deliver(renderer.media());
+            let out = renderer.mix_audio_resident(&project, 40_000, 8);
+            if out.iter().any(|v| (v - 0.5).abs() < 0.01) {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "o original nunca chegou"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Exportar para `.gif` gera um GIF de verdade (e não deixa o vídeo temporário para trás).
+    #[test]
+    fn exporting_to_gif_makes_a_gif_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::state::AppState::new(Project::new(ProjectSettings {
+            width: 320,
+            height: 180,
+            ..ProjectSettings::default()
+        }));
+        st.drop_generator(crate::state::Generator::SolidColor, 0, 0);
+        let project = st.project().clone();
+        let out = dir.path().join("saida.gif");
+        let settings = pawcut_export::ExportSettings {
+            output: out.clone(),
+            crf: 28,
+            range: Some((0, 20)),
+            size: None,
+            codec: pawcut_export::VideoCodec::H264,
+            audio_only: None,
+            fps: None,
+            bitrate_kbps: None,
+            speed: pawcut_export::EncoderSpeed::Ultrafast,
+            audio_kbps: Some(128),
+            blur_bars: false,
+        };
+        let job = ExportJob::start(project, settings, || {});
+        let start = std::time::Instant::now();
+        let result = loop {
+            if let Some(r) = job.finished() {
+                break r;
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "não terminou");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(result.is_ok(), "{result:?}");
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(b"GIF89a"), "não é um GIF");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, ["saida.gif"], "sem arquivos temporários");
     }
 
     #[test]

@@ -261,3 +261,37 @@ pub fn speech_with_pause(dir: &Path) -> PathBuf {
     ]);
     out
 }
+
+/// WAV mono 48 kHz de ruído branco (sempre o mesmo), a partir de `start` s do ruído: dois
+/// arquivos com `start` diferente são o mesmo som com o começo deslocado (para testar sincronia).
+pub fn noise_audio(dir: &Path, name: &str, start: f32, secs: f32) -> PathBuf {
+    let out = dir.join(name);
+    let filter = format!(
+        "anoisesrc=d={}:c=white:r=48000:seed=7:a=0.5,atrim=start={start},asetpts=PTS-STARTPTS",
+        start + secs
+    );
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &filter,
+        "-c:a",
+        "pcm_f32le",
+        out.to_str().unwrap(),
+    ]);
+    out
+}
+
+/// Vídeo 480x270 a 30 fps filmado "na mão": o quadro balança no X (±25 px, `sin(0,9·n)`) e no
+/// Y (±15 px) em cima de um padrão de teste fixo. Serve para o estabilizador.
+pub fn shaky_video(dir: &Path, secs: u32) -> PathBuf {
+    let out = dir.join("shaky.mp4");
+    let src = format!(
+        "testsrc2=s=640x360:r=30:d={secs},crop=w=480:h=270:x='80+25*sin(n*0.9)':y='45+15*cos(n*1.3)',format=yuv420p"
+    );
+    let out_s = out.to_str().expect("caminho utf-8");
+    ffmpeg(&[
+        "-f", "lavfi", "-i", &src, "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", out_s,
+    ]);
+    out
+}

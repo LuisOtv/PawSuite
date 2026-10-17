@@ -749,19 +749,11 @@ impl Workspace {
                 .max_rect(left)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
             |ui| {
-                if ui
-                    .small_button("In")
-                    .on_hover_text("Marcar entrada (I)")
-                    .clicked()
-                {
+                if icons::button(ui, Icon::MarkIn, 14.0, false, "Marcar entrada (I)").clicked() {
                     self.st.active_monitor = monitor;
                     self.st.mark(true);
                 }
-                if ui
-                    .small_button("Out")
-                    .on_hover_text("Marcar saída (O)")
-                    .clicked()
-                {
+                if icons::button(ui, Icon::MarkOut, 14.0, false, "Marcar saída (O)").clicked() {
                     self.st.active_monitor = monitor;
                     self.st.mark(false);
                 }

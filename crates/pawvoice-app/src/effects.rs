@@ -72,6 +72,44 @@ pub fn peak_normalize(p: &mut [Vec<f32>]) {
     }
 }
 
+/// Trechos com som (o contrário dos silêncios): pausas de pelo menos `min_silence` s
+/// separam os trechos, e trechos menores que `min_sound` s são ignorados (estalos).
+pub fn sound_ranges(
+    mono: &[f32],
+    rate: u32,
+    threshold_db: f32,
+    min_silence: f32,
+    min_sound: f32,
+) -> Vec<(usize, usize)> {
+    let silences = dsp::silent_runs_mono(mono, rate, threshold_db, min_silence as f64, 0.0);
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (a, b) in silences.into_iter().chain([(mono.len(), mono.len())]) {
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(b);
+    }
+    let min = (min_sound * rate as f32) as usize;
+    out.retain(|(a, b)| b - a >= min);
+    out
+}
+
+/// Os canais juntos num só (o maior módulo de cada instante).
+pub fn mono_max(p: &[Vec<f32>]) -> Vec<f32> {
+    (0..p.first().map_or(0, Vec::len))
+        .map(|i| p.iter().map(|c| c[i].abs()).fold(0.0, f32::max))
+        .collect()
+}
+
+/// Os canais somados num só (média), para quem precisa de mono com sinal (o whisper).
+pub fn mono_max_signed(p: &[Vec<f32>]) -> Vec<f32> {
+    let n = p.first().map_or(0, Vec::len);
+    (0..n)
+        .map(|i| p.iter().map(|c| c[i]).sum::<f32>() / p.len() as f32)
+        .collect()
+}
+
 /// "Melhorar voz" em um clique: passa-altas, noise gate automático, compressor médio,
 /// loudness no alvo e limitador em −1 dB.
 pub fn enhance_voice(p: &mut [Vec<f32>], rate: u32, target: f32) {
@@ -88,6 +126,27 @@ pub fn enhance_voice(p: &mut [Vec<f32>], rate: u32, target: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_ranges_split_on_long_pauses_and_drop_blips() {
+        let rate = 48_000usize;
+        let mut s = vec![0.0f32; rate * 6];
+        let tone = |s: &mut [f32]| {
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = 0.3 * (i as f32 * 0.05).sin();
+            }
+        };
+        tone(&mut s[rate / 2..rate * 3 / 2]); // 0,5–1,5 s
+        tone(&mut s[rate * 3..rate * 4]); // 3–4 s
+        tone(&mut s[rate * 5..rate * 5 + 200]); // estalo de 4 ms
+        let r = sound_ranges(&s, rate as u32, -40.0, 0.5, 0.2);
+        assert_eq!(r.len(), 2, "{r:?}");
+        let near = |a: usize, secs: f32| (a as f32 - secs * rate as f32).abs() < 1500.0;
+        assert!(near(r[0].0, 0.5) && near(r[0].1, 1.5), "{r:?}");
+        assert!(near(r[1].0, 3.0) && near(r[1].1, 4.0), "{r:?}");
+        // silêncio total: nada
+        assert!(sound_ranges(&vec![0.0; rate], rate as u32, -40.0, 0.5, 0.2).is_empty());
+    }
 
     #[test]
     fn enhance_voice_reaches_the_loudness_target() {

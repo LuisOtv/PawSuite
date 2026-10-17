@@ -8,7 +8,7 @@
 
 use std::f32::consts::{PI, TAU};
 
-use egui::{Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, vec2};
+use egui::{Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2};
 
 use crate::theme;
 
@@ -52,6 +52,7 @@ pub enum Icon {
     Brush,
     Eraser,
     Smudge,
+    Clone,
     Bucket,
     Gradient,
     Eyedropper,
@@ -101,6 +102,11 @@ pub enum Icon {
     Reset,
     Wheel,
     Check,
+    /// Marcar entrada / saída (colchetes).
+    MarkIn,
+    MarkOut,
+    /// Máscara de camada (quadrado com círculo).
+    Mask,
 }
 
 impl Icon {
@@ -142,6 +148,7 @@ impl Icon {
         Icon::Brush,
         Icon::Eraser,
         Icon::Smudge,
+        Icon::Clone,
         Icon::Bucket,
         Icon::Gradient,
         Icon::Eyedropper,
@@ -190,6 +197,9 @@ impl Icon {
         Icon::Reset,
         Icon::Wheel,
         Icon::Check,
+        Icon::MarkIn,
+        Icon::MarkOut,
+        Icon::Mask,
     ];
 }
 
@@ -594,6 +604,14 @@ pub fn paint(painter: &Painter, r: Rect, icon: Icon, c: Color32) {
             pen.line(3.0, 16.0, 12.0, 16.0);
             pen.circle(16.5, 12.0, 4.5);
         }
+        Icon::Clone => {
+            // carimbo: cabo, base larga e o "pé" com a marca
+            pen.rect(9.0, 3.0, 6.0, 9.0, 3.0);
+            pen.line(5.0, 12.0, 19.0, 12.0);
+            pen.rect(5.0, 12.0, 14.0, 4.0, 1.5);
+            pen.line(4.0, 21.0, 20.0, 21.0);
+            pen.circle(12.0, 18.5, 1.5);
+        }
         Icon::Bucket => {
             pen.closed(&[(11.0, 3.5), (19.0, 11.5), (11.5, 19.0), (3.5, 11.0)]);
             pen.line(5.0, 13.0, 17.5, 13.0);
@@ -851,6 +869,24 @@ pub fn paint(painter: &Painter, r: Rect, icon: Icon, c: Color32) {
                 pen.line(10.5, 7.5, 10.5, 13.5);
             }
         }
+        Icon::Mask => {
+            pen.rect(3.5, 3.5, 17.0, 17.0, 2.0);
+            pen.circle(12.0, 12.0, 5.0);
+        }
+        Icon::MarkIn | Icon::MarkOut => {
+            // colchete com uma setinha apontando para dentro
+            let (x, dir) = if icon == Icon::MarkIn {
+                (7.0, 1.0)
+            } else {
+                (17.0, -1.0)
+            };
+            pen.line(x, 4.0, x, 20.0);
+            pen.line(x, 4.0, x + 4.0 * dir, 4.0);
+            pen.line(x, 20.0, x + 4.0 * dir, 20.0);
+            pen.line(x + 3.0 * dir, 12.0, x + 9.0 * dir, 12.0);
+            pen.line(x + 6.5 * dir, 9.0, x + 9.0 * dir, 12.0);
+            pen.line(x + 6.5 * dir, 15.0, x + 9.0 * dir, 12.0);
+        }
         Icon::Gear => {
             let pts: Vec<(f32, f32)> = (0..32)
                 .map(|i| {
@@ -996,6 +1032,67 @@ pub fn button(ui: &mut Ui, icon: Icon, size: f32, on: bool, tip: &str) -> Respon
         icon,
         color,
     );
+    if tip.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(tip)
+    }
+}
+
+/// Botão com ícone e nome juntos, numa peça só (fundo e destaque cobrem os dois).
+pub fn button_labeled(
+    ui: &mut Ui,
+    icon: Icon,
+    size: f32,
+    on: bool,
+    label: &str,
+    tip: &str,
+) -> Response {
+    let font = egui::FontId::proportional(11.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, Color32::WHITE);
+    let (pad, gap) = (4.0, 6.0);
+    let w = pad + size + gap + galley.size().x + pad + 2.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, size + 8.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let bg = if on {
+        Some(theme::ACCENT.gamma_multiply(0.22))
+    } else if resp.is_pointer_button_down_on() {
+        Some(theme::BAR_LIGHT.gamma_multiply(1.3))
+    } else if resp.hovered() {
+        Some(theme::BAR_LIGHT)
+    } else {
+        // repouso: uma placa discreta, para o botão inteiro ser visível mesmo desligado
+        Some(theme::BAR_LIGHT.gamma_multiply(0.8))
+    };
+    if let Some(bg) = bg {
+        ui.painter().rect_filled(rect, 4.0, bg);
+    }
+    let (icon_color, text_color) = if !ui.is_enabled() {
+        let c = theme::TEXT_DIM.gamma_multiply(0.6);
+        (c, c)
+    } else if on {
+        (theme::ACCENT, theme::TEXT)
+    } else if resp.hovered() {
+        (Color32::WHITE, Color32::WHITE)
+    } else {
+        (theme::TEXT, theme::TEXT_DIM)
+    };
+    let icon_rect = Rect::from_min_size(
+        rect.left_center() + vec2(pad, -size / 2.0),
+        vec2(size, size),
+    );
+    paint(ui.painter(), icon_rect, icon, icon_color);
+    ui.painter().galley(
+        pos2(
+            icon_rect.right() + gap,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        text_color,
+    );
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if tip.is_empty() {
         resp
     } else {

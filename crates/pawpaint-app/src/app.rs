@@ -193,6 +193,7 @@ pub fn run_radial(st: &mut State, id: &str) {
         "export" => ask(st, Purpose::Export),
         "mirror_h" => st.mirror.0 = !st.mirror.0,
         "mirror_v" => st.mirror.1 = !st.mirror.1,
+        "wrap" => st.wrap = !st.wrap,
         _ if st.docs.is_empty() => {}
         "undo" => {
             if let Some(d) = st.doc_mut() {
@@ -254,7 +255,9 @@ pub fn run_radial(st: &mut State, id: &str) {
 
 fn autosave_dir() -> PathBuf {
     if cfg!(test) {
-        return std::env::temp_dir().join("pawpaint-test-autosave");
+        // Uma pasta por thread de teste: testes em paralelo usam o mesmo `uid` e se apagariam.
+        let thread = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        return std::env::temp_dir().join(format!("pawpaint-test-autosave-{thread}"));
     }
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -440,6 +443,8 @@ impl TabViewer for Viewer<'_> {
                     Panel::Palette => scroll(ui, &mut |ui| docks::palette(st, ui)),
                     Panel::Overview => docks::overview(st, ui),
                     Panel::History => docks::history(st, ui),
+                    Panel::Reference => docks::reference(st, ui),
+                    Panel::Histogram => docks::histogram(st, ui),
                 }
             });
     }
@@ -483,6 +488,13 @@ impl PaintApp {
             .iter()
             .map(|b| docks::brush_thumb(ctx, b, &b.name))
             .collect();
+        // Para os testes visuais: `PAWPAINT_PANEL=BrushEditor` traz esse docker para a frente.
+        if let Ok(name) = std::env::var("PAWPAINT_PANEL")
+            && let Some(panel) = Panel::ALL.into_iter().find(|p| format!("{p:?}") == name)
+            && let Some(path) = app.dock.find_tab(&panel)
+        {
+            let _ = app.dock.set_active_tab(path);
+        }
         for p in args {
             open_path(&mut app.st, &p);
         }
@@ -513,6 +525,10 @@ impl PaintApp {
                 hsv: (0.0, 0.0, 0.0),
                 blend: BlendMode::Normal,
                 mirror: (false, false),
+                wrap: false,
+                symmetry: 1,
+                placing_ruler: false,
+                ruler_lock: false,
                 opts: ToolOpts::default(),
                 clipboard: None,
                 toasts: Toasts::default(),
@@ -533,6 +549,11 @@ impl PaintApp {
                 allow_close: false,
                 tool_changed: false,
                 last_autosave: std::time::Instant::now(),
+                pen: None,
+                clone_source: None,
+                clone_offset: None,
+                reference: None,
+                new_adjust: None,
                 autosave_job: None,
                 autosave_closed: Default::default(),
                 popup_palette: None,
@@ -683,6 +704,10 @@ fn open_path(st: &mut State, p: &Path) {
     }
 }
 
+pub fn ask_reference(st: &mut State) {
+    ask(st, Purpose::Reference);
+}
+
 fn ask(st: &mut State, purpose: Purpose) {
     if st.file.is_some() {
         return;
@@ -728,6 +753,12 @@ fn ask(st: &mut State, purpose: Purpose) {
                 .add_filter("BMP", &["bmp"])
                 .set_file_name(format!("{name}.png"))
                 .save_file()
+                .into_iter()
+                .collect(),
+            Purpose::Reference => d
+                .set_title("Imagem de referência")
+                .add_filter("Imagens", &["png", "jpg", "jpeg", "webp", "bmp"])
+                .pick_file()
                 .into_iter()
                 .collect(),
             Purpose::ExportJpg => d
@@ -779,6 +810,19 @@ fn poll_file(st: &mut State) {
                 }
             }
         }
+        Purpose::Reference => match file::open_image(&paths[0]) {
+            Ok(img) => {
+                let name = paths[0]
+                    .file_name()
+                    .map_or("referência".into(), |n| n.to_string_lossy().into_owned());
+                st.reference = Some(crate::state::Reference {
+                    name,
+                    img,
+                    tex: None,
+                });
+            }
+            Err(e) => st.warn(e.to_string()),
+        },
         Purpose::Export => {
             let Some(d) = st.doc() else { return };
             match file::export_image(d.ed.doc(), &paths[0], 92) {
@@ -832,17 +876,7 @@ fn save(st: &mut State) {
 }
 
 fn open_filter(st: &mut State, kind: FilterKind) {
-    let (a, b, c) = match kind {
-        FilterKind::BrightnessContrast => (0.0, 0.0, 0.0),
-        FilterKind::HueSaturation => (0.0, 0.0, 0.0),
-        FilterKind::Levels => (0.0, 1.0, 1.0),
-        FilterKind::Threshold => (0.5, 0.0, 0.0),
-        FilterKind::Posterize => (4.0, 0.0, 0.0),
-        FilterKind::Blur => (4.0, 0.0, 0.0),
-        FilterKind::Sharpen => (1.0, 1.5, 0.0),
-        FilterKind::Pixelate => (8.0, 0.0, 0.0),
-        FilterKind::Noise => (0.2, 0.0, 0.0),
-    };
+    let (a, b, c) = filter_defaults(&kind);
     st.dialog = Some(Dialog::Filter {
         kind,
         a,
@@ -853,6 +887,121 @@ fn open_filter(st: &mut State, kind: FilterKind) {
         last_ms: 0.0,
         waiting: false,
     });
+}
+
+/// Valores de partida de cada filtro (os do diálogo).
+fn filter_defaults(kind: &FilterKind) -> (f32, f32, f32) {
+    match kind {
+        FilterKind::BrightnessContrast => (0.0, 0.0, 0.0),
+        FilterKind::HueSaturation => (0.0, 0.0, 0.0),
+        FilterKind::Levels => (0.0, 1.0, 1.0),
+        FilterKind::Threshold => (0.5, 0.0, 0.0),
+        FilterKind::Posterize => (4.0, 0.0, 0.0),
+        FilterKind::Blur => (4.0, 0.0, 0.0),
+        FilterKind::Sharpen => (1.0, 1.5, 0.0),
+        FilterKind::Pixelate => (8.0, 0.0, 0.0),
+        FilterKind::Noise => (0.2, 0.0, 0.0),
+    }
+}
+
+/// O diálogo certo para editar um filtro que já existe (da camada de ajuste).
+fn dialog_for_filter(f: &Filter) -> Option<Dialog> {
+    let (kind, a, b, c) = match f {
+        Filter::BrightnessContrast {
+            brightness,
+            contrast,
+        } => (FilterKind::BrightnessContrast, *brightness, *contrast, 0.0),
+        Filter::HueSaturation {
+            hue,
+            saturation,
+            lightness,
+        } => (FilterKind::HueSaturation, *hue, *saturation, *lightness),
+        Filter::Levels {
+            black,
+            white,
+            gamma,
+        } => (FilterKind::Levels, *black, *white, *gamma),
+        Filter::Threshold(t) => (FilterKind::Threshold, *t, 0.0, 0.0),
+        Filter::Posterize(n) => (FilterKind::Posterize, *n as f32, 0.0, 0.0),
+        Filter::Curves(points) => {
+            return Some(Dialog::Curves {
+                points: points.clone(),
+                drag: None,
+                applied: false,
+            });
+        }
+        _ => return None,
+    };
+    Some(Dialog::Filter {
+        kind,
+        a,
+        b,
+        c,
+        preview: true,
+        applied: false,
+        last_ms: 0.0,
+        waiting: false,
+    })
+}
+
+/// Cria uma camada de ajuste acima da ativa. Filtros com parâmetros abrem o diálogo (e Cancelar
+/// desfaz a criação); inverter e dessaturar valem na hora.
+pub fn new_adjustment(st: &mut State, filter: Filter) {
+    let Some(d) = st.doc_mut() else { return };
+    let prev = d.active;
+    let name = match &filter {
+        Filter::BrightnessContrast { .. } => "Brilho e contraste",
+        Filter::HueSaturation { .. } => "Matiz e saturação",
+        Filter::Levels { .. } => "Níveis",
+        Filter::Curves(_) => "Curvas",
+        Filter::Invert => "Inverter",
+        Filter::Desaturate => "Preto e branco",
+        Filter::Threshold(_) => "Limiar",
+        Filter::Posterize(_) => "Posterizar",
+        _ => "Ajuste",
+    };
+    match d
+        .ed
+        .add_adjustment_layer(filter.clone(), Some(name.into()), Some(prev))
+    {
+        Ok(id) => {
+            d.active = id;
+            let dialog = if matches!(filter, Filter::Invert | Filter::Desaturate) {
+                None
+            } else {
+                dialog_for_filter(&filter)
+            };
+            if let Some(dlg) = dialog {
+                st.new_adjust = Some(prev);
+                st.dialog = Some(dlg);
+            }
+        }
+        Err(e) => st.warn(e.to_string()),
+    }
+}
+
+/// Abre o diálogo do filtro da camada de ajuste `id` para mudar os valores.
+pub fn edit_adjustment(st: &mut State, id: pawpaint_core::doc::LayerId) {
+    let Some(d) = st.doc_mut() else { return };
+    d.active = id;
+    let Some(f) = d.ed.doc().layer(id).and_then(|l| l.adjust.clone()) else {
+        return;
+    };
+    st.new_adjust = None;
+    match dialog_for_filter(&f) {
+        Some(dlg) => st.dialog = Some(dlg),
+        None => st.say("Esse ajuste não tem parâmetros para editar"),
+    }
+}
+
+/// Fim do diálogo de uma camada de ajuste nova que foi cancelada: tira a camada de vez.
+fn drop_new_adjustment(st: &mut State) {
+    if let Some(prev) = st.new_adjust.take()
+        && let Some(d) = st.doc_mut()
+    {
+        d.ed.undo();
+        d.active = prev;
+    }
 }
 
 fn filter_of(kind: &FilterKind, a: f32, b: f32, c: f32) -> (Filter, &'static str) {
@@ -962,6 +1111,14 @@ impl PaintApp {
                 if item(ui, "Importar como camada…", "", has_doc) {
                     ui.close();
                     ask(st, Purpose::ImportLayer);
+                }
+                if item(ui, "Abrir imagem de referência…", "", true) {
+                    ui.close();
+                    ask(st, Purpose::Reference);
+                    // o painel aparece junto
+                    if self.dock.find_tab(&Panel::Reference).is_none() {
+                        st.dock_commands.push(DockCommand::Toggle(Panel::Reference));
+                    }
                 }
                 ui.separator();
                 if item(ui, "Salvar", "Ctrl+S", has_doc) {
@@ -1163,6 +1320,43 @@ impl PaintApp {
                     ui.close();
                     new_layer(st);
                 }
+                ui.menu_button("Nova camada de ajuste", |ui| {
+                    for (label, f) in [
+                        (
+                            "Brilho e contraste…",
+                            Filter::BrightnessContrast {
+                                brightness: 0.0,
+                                contrast: 0.0,
+                            },
+                        ),
+                        (
+                            "Matiz e saturação…",
+                            Filter::HueSaturation {
+                                hue: 0.0,
+                                saturation: 0.0,
+                                lightness: 0.0,
+                            },
+                        ),
+                        (
+                            "Níveis…",
+                            Filter::Levels {
+                                black: 0.0,
+                                white: 1.0,
+                                gamma: 1.0,
+                            },
+                        ),
+                        ("Curvas…", Filter::Curves(vec![(0.0, 0.0), (1.0, 1.0)])),
+                        ("Limiar…", Filter::Threshold(0.5)),
+                        ("Posterizar…", Filter::Posterize(4)),
+                        ("Preto e branco", Filter::Desaturate),
+                        ("Inverter cores", Filter::Invert),
+                    ] {
+                        if item(ui, label, "", has_doc) {
+                            ui.close();
+                            new_adjustment(st, f);
+                        }
+                    }
+                });
                 if item(ui, "Duplicar", "Ctrl+J", has_doc) {
                     ui.close();
                     dup_layer(st);
@@ -1271,6 +1465,52 @@ impl PaintApp {
                     ui.close();
                     zoom_by(st, 0.8);
                 }
+                ui.separator();
+                if item(ui, "Girar a visão para a direita", "Ctrl+]", has_doc) {
+                    ui.close();
+                    turn_view(st, 15.0);
+                }
+                if item(ui, "Girar a visão para a esquerda", "Ctrl+[", has_doc) {
+                    ui.close();
+                    turn_view(st, -15.0);
+                }
+                if item(ui, "Zerar a rotação da visão", "5", has_doc) {
+                    ui.close();
+                    reset_view_turn(st);
+                }
+                if item(ui, "Espelhar a visão", "M", has_doc) {
+                    ui.close();
+                    flip_view(st);
+                }
+                ui.separator();
+                if item(ui, "Colocar régua (arraste na imagem)", "", has_doc) {
+                    ui.close();
+                    st.placing_ruler = true;
+                    st.say("Arraste na imagem para traçar a régua; traços que começam perto dela ficam retos");
+                }
+                let has_ruler = st.doc().is_some_and(|d| d.ruler.is_some());
+                if item(ui, "Tirar a régua", "", has_ruler) {
+                    ui.close();
+                    st.placing_ruler = false;
+                    if let Some(d) = st.doc_mut() {
+                        d.ruler = None;
+                    }
+                }
+                ui.separator();
+                let label = if st.wrap {
+                    "Desligar o modo de repetição (mosaico)"
+                } else {
+                    "Modo de repetição (mosaico) para texturas"
+                };
+                if item(ui, label, "Shift+W", has_doc) {
+                    ui.close();
+                    st.wrap = !st.wrap;
+                }
+                ui.label(
+                    RichText::new("Shift + Espaço + arrastar também gira")
+                        .weak()
+                        .small(),
+                );
             });
             ui.menu_button("Configurações", |ui| {
                 ui.menu_button("Dockers", |ui| {
@@ -1436,6 +1676,28 @@ impl PaintApp {
 fn commit_if_floating(d: &mut DocView) {
     if d.float.is_some() {
         canvas::commit_float(d);
+    }
+}
+
+/// Gira a visão `deg` graus em volta do centro.
+pub fn turn_view(st: &mut State, deg: f32) {
+    if let Some(d) = st.doc_mut() {
+        canvas::rotate_view(d, deg);
+        d.fit = false;
+    }
+}
+
+pub fn reset_view_turn(st: &mut State) {
+    if let Some(d) = st.doc_mut() {
+        d.view_rot = 0.0;
+        d.view_flip = false;
+    }
+}
+
+/// Espelha a visão na horizontal (para ver o desenho "com olhos novos").
+pub fn flip_view(st: &mut State) {
+    if let Some(d) = st.doc_mut() {
+        d.view_flip = !d.view_flip;
     }
 }
 
@@ -1676,6 +1938,21 @@ impl PaintApp {
         if hit(ctrl, Key::Num1) {
             zoom_to(st, 1.0);
         }
+        if hit(ctrl, Key::CloseBracket) {
+            turn_view(st, 15.0);
+        }
+        if hit(ctrl, Key::OpenBracket) {
+            turn_view(st, -15.0);
+        }
+        if hit(Modifiers::NONE, Key::Num5) {
+            reset_view_turn(st);
+        }
+        if hit(Modifiers::NONE, Key::M) {
+            flip_view(st);
+        }
+        if hit(Modifiers::SHIFT, Key::W) {
+            st.wrap = !st.wrap;
+        }
         if hit(Modifiers::NONE, Key::Plus) || hit(Modifiers::NONE, Key::Equals) {
             zoom_by(st, 1.25);
         }
@@ -1722,6 +1999,7 @@ impl PaintApp {
                 "B" => Key::B,
                 "E" => Key::E,
                 "S" => Key::S,
+                "H" => Key::H,
                 "F" => Key::F,
                 "G" => Key::G,
                 "P" => Key::P,
@@ -1909,6 +2187,7 @@ impl PaintApp {
                     if paw_ui::theme::primary_button(ui, "Aplicar").clicked() || enter {
                         keep = false;
                         then = Some(Box::new(move |st| {
+                            st.new_adjust = None;
                             if !applied_now && let Some(d) = st.doc_mut() {
                                 let id = d.active;
                                 if let Err(e) = d.ed.apply_filter(id, &f, label) {
@@ -1923,6 +2202,7 @@ impl PaintApp {
                             if applied_now && let Some(d) = st.doc_mut() {
                                 d.ed.undo();
                             }
+                            drop_new_adjustment(st);
                         }));
                     }
                 });
@@ -2031,6 +2311,7 @@ impl PaintApp {
                     if paw_ui::theme::primary_button(ui, "Aplicar").clicked() || enter {
                         keep = false;
                         then = Some(Box::new(move |st| {
+                            st.new_adjust = None;
                             if !applied_now && let Some(d) = st.doc_mut() {
                                 let id = d.active;
                                 let _ = d.ed.apply_filter(id, &Filter::Curves(pts), "Curvas");
@@ -2043,6 +2324,7 @@ impl PaintApp {
                             if applied_now && let Some(d) = st.doc_mut() {
                                 d.ed.undo();
                             }
+                            drop_new_adjustment(st);
                         }));
                     }
                 });
@@ -2566,6 +2848,539 @@ mod tests {
         assert_eq!(d.ed.undo_label(), Some("Pincel"));
         d.ed.undo();
         assert_eq!(h.px(140, 100), [255, 255, 255, 255]);
+    }
+
+    /// Pinta na janela, de `a` até `b` (em pixels da janela), com o mouse.
+    fn paint_screen(h: &mut Harness, a: Pos2, b: Pos2) {
+        h.frame(vec![Event::PointerMoved(a)]);
+        h.frame(vec![Event::PointerButton {
+            pos: a,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        for i in 1..=6 {
+            h.frame(vec![Event::PointerMoved(a.lerp(b, i as f32 / 6.0))]);
+        }
+        h.frame(vec![Event::PointerButton {
+            pos: b,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        h.frame(vec![]);
+    }
+
+    #[test]
+    fn rotated_and_mirrored_views_paint_where_the_image_is_shown() {
+        let setup = |rot: f32, flip: bool| {
+            let mut h = Harness::new();
+            h.app.st.brush = Brush {
+                size: 6.0,
+                hardness: 1.0,
+                ..Brush::basic()
+            };
+            h.app.st.fg = [255, 0, 0];
+            h.app.st.tool = Tool::Brush;
+            {
+                let d = h.app.st.doc_mut().unwrap();
+                d.view_rot = rot;
+                d.view_flip = flip;
+                d.fit = false;
+                d.zoom = 1.0;
+            }
+            h.frame(vec![]);
+            h.frame(vec![]);
+            h
+        };
+        let to_screen = |h: &Harness, x: f32, y: f32| {
+            let d = h.app.st.doc().unwrap();
+            canvas::ViewXf::new(
+                d.view_center,
+                d.zoom,
+                d.view_rot,
+                d.view_flip,
+                (300.0, 200.0),
+            )
+            .project(x, y)
+        };
+        // Girada 90°: um traço na janela, da esquerda para a direita, vira vertical na imagem
+        // (a imagem aparece deitada).
+        let mut h = setup(90.0, false);
+        let c = h.app.st.doc().unwrap().view_center;
+        paint_screen(&mut h, c + vec2(-60.0, 0.0), c + vec2(60.0, 0.0));
+        let drawn: Vec<(usize, usize)> = (0..200)
+            .flat_map(|y| (0..300).map(move |x| (x, y)))
+            .filter(|(x, y)| h.px(*x, *y)[1] < 100)
+            .collect();
+        assert!(drawn.len() > 300, "pintou: {}", drawn.len());
+        let (min_x, max_x) = drawn
+            .iter()
+            .fold((999, 0), |(a, b), (x, _)| (a.min(*x), b.max(*x)));
+        let (min_y, max_y) = drawn
+            .iter()
+            .fold((999, 0), |(a, b), (_, y)| (a.min(*y), b.max(*y)));
+        assert!(
+            max_x - min_x < 12,
+            "estreito na horizontal: {min_x}..{max_x}"
+        );
+        assert!(
+            max_y - min_y > 100,
+            "comprido na vertical: {min_y}..{max_y}"
+        );
+        // o ponto de tela do centro da imagem cai no centro dela
+        let d = h.app.st.doc().unwrap();
+        let back = canvas::ViewXf::new(
+            d.view_center,
+            d.zoom,
+            d.view_rot,
+            d.view_flip,
+            (300.0, 200.0),
+        );
+        let p = back.unproject(to_screen(&h, 77.0, 33.0));
+        assert!((p.x - 77.0).abs() < 1e-3 && (p.y - 33.0).abs() < 1e-3);
+
+        // Espelhada: um traço que vai até o lado direito da janela pinta o lado esquerdo.
+        let mut h = setup(0.0, true);
+        let c = h.app.st.doc().unwrap().view_center;
+        paint_screen(&mut h, c + vec2(20.0, 0.0), c + vec2(110.0, 0.0));
+        assert!(h.px(150 - 100, 100)[1] < 100, "pintou à esquerda do centro");
+        assert!(h.px(150 + 100, 100)[1] > 200, "e não à direita");
+        // visão girada não muda a imagem: salvar e desfazer seguem normais
+        assert!(h.app.st.doc().unwrap().ed.is_dirty());
+    }
+
+    #[test]
+    fn shift_click_draws_a_straight_line_from_the_last_stroke() {
+        let mut h = Harness::new();
+        h.app.st.brush = Brush {
+            size: 6.0,
+            hardness: 1.0,
+            ..Brush::basic()
+        };
+        h.app.st.fg = [0, 0, 255];
+        h.app.st.tool = Tool::Brush;
+        // primeiro traço curto termina em (40, 50)
+        let a = h.screen(30.0, 50.0);
+        paint_screen(&mut h, a, a + vec2(10.0, 0.0));
+        assert!(h.px(150, 50)[0] > 200, "ainda não pintou ali");
+        // Shift+clique em (200, 50): liga as duas pontas
+        h.frame(vec![Event::ModifiersChanged(Modifiers::SHIFT)]);
+        let b = h.screen(200.0, 50.0);
+        h.frame(vec![Event::PointerMoved(b)]);
+        h.frame(vec![Event::PointerButton {
+            pos: b,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::SHIFT,
+        }]);
+        h.frame(vec![Event::PointerButton {
+            pos: b,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::SHIFT,
+        }]);
+        h.frame(vec![Event::ModifiersChanged(Modifiers::NONE)]);
+        assert!(h.px(120, 50)[0] < 60, "a reta passa pelo meio");
+        assert!(h.px(200, 50)[0] < 60);
+        assert!(h.px(120, 80)[0] > 200, "e fica fina");
+        // sem Shift, o próximo clique não liga com nada
+        let c = h.screen(100.0, 150.0);
+        paint_screen(&mut h, c, c + vec2(0.5, 0.0));
+        assert!(h.px(150, 120)[0] > 200);
+    }
+
+    #[test]
+    fn alt_drag_resizes_the_brush_without_painting() {
+        let mut h = Harness::new();
+        h.app.st.brush = Brush {
+            size: 10.0,
+            hardness: 1.0,
+            ..Brush::basic()
+        };
+        h.app.st.tool = Tool::Brush;
+        h.frame(vec![Event::ModifiersChanged(Modifiers::ALT)]);
+        let a = h.screen(100.0, 100.0);
+        h.frame(vec![Event::PointerMoved(a)]);
+        h.frame(vec![Event::PointerButton {
+            pos: a,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::ALT,
+        }]);
+        for dx in [10.0, 30.0, 60.0] {
+            h.frame(vec![Event::PointerMoved(a + vec2(dx, 0.0))]);
+        }
+        let grown = h.app.st.brush.size;
+        assert!(grown > 20.0, "cresceu: {grown}");
+        // para a esquerda diminui, e nunca passa de 1
+        h.frame(vec![Event::PointerMoved(a - vec2(500.0, 0.0))]);
+        assert_eq!(h.app.st.brush.size, 1.0);
+        h.frame(vec![Event::PointerButton {
+            pos: a,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::ALT,
+        }]);
+        h.frame(vec![Event::ModifiersChanged(Modifiers::NONE)]);
+        assert!(h.app.st.interaction.is_none());
+        // nada foi pintado na imagem
+        assert_eq!(h.px(100, 100), [255, 255, 255, 255]);
+        assert!(!h.app.st.doc().unwrap().ed.is_dirty());
+    }
+
+    #[test]
+    fn strokes_that_start_near_the_ruler_stay_on_its_line() {
+        let mut h = Harness::new();
+        h.app.st.brush = Brush {
+            size: 4.0,
+            hardness: 1.0,
+            ..Brush::basic()
+        };
+        h.app.st.fg = [0, 0, 0];
+        h.app.st.tool = Tool::Brush;
+        // régua horizontal em y = 100
+        h.app.st.placing_ruler = true;
+        let (a, b) = (h.screen(20.0, 100.0), h.screen(200.0, 100.0));
+        paint_screen(&mut h, a, b);
+        assert!(!h.app.st.placing_ruler);
+        assert!(!h.app.st.doc().unwrap().ed.is_dirty(), "régua não pinta");
+        assert!(h.app.st.doc().unwrap().ruler.is_some());
+        // traço torto que começa perto da régua: sai reto em y = 100
+        let (c, d) = (h.screen(40.0, 103.0), h.screen(160.0, 140.0));
+        paint_screen(&mut h, c, d);
+        assert!(h.px(100, 100)[0] < 60, "ficou na régua");
+        assert!(h.px(150, 130)[0] > 200, "não seguiu o mouse");
+        // começando longe da régua, o traço é livre
+        let (e, f) = (h.screen(40.0, 200.0), h.screen(160.0, 230.0));
+        paint_screen(&mut h, e, f);
+        assert!(h.px(100, 215)[0] < 100, "livre");
+        assert!(!h.app.st.ruler_lock);
+    }
+
+    #[test]
+    fn clone_stamp_copies_from_the_alt_click_source() {
+        let mut h = Harness::new();
+        {
+            let d = h.app.st.doc_mut().unwrap();
+            let id = d.active;
+            d.ed.set_selection(
+                Some(pawpaint_core::selection::Selection::rect(
+                    300, 200, 20, 20, 60, 60,
+                )),
+                "t",
+            );
+            d.ed.fill_selection(id, [255, 0, 0]).unwrap();
+            d.ed.deselect();
+        }
+        h.app.st.brush = Brush {
+            size: 10.0,
+            hardness: 1.0,
+            ..Brush::basic()
+        };
+        h.app.st.tool = Tool::Clone;
+        // sem origem: avisa e não pinta
+        let at = h.screen(160.0, 40.0);
+        paint_screen(&mut h, at, at + vec2(10.0, 0.0));
+        assert_eq!(h.px(165, 40), [255, 255, 255, 255]);
+        assert!(h.app.st.clone_source.is_none());
+        // Alt+clique escolhe a origem no quadrado vermelho
+        h.frame(vec![Event::ModifiersChanged(Modifiers::ALT)]);
+        h.mv(40.0, 40.0);
+        h.button(40.0, 40.0, true, Modifiers::ALT);
+        h.button(40.0, 40.0, false, Modifiers::ALT);
+        h.frame(vec![Event::ModifiersChanged(Modifiers::NONE)]);
+        assert_eq!(
+            h.app.st.clone_source.map(|p| (p.0.round(), p.1.round())),
+            Some((40.0, 40.0))
+        );
+        // pinta em outro lugar: sai vermelho (copiado), não a cor do pincel
+        h.app.st.fg = [0, 0, 255];
+        paint_screen(&mut h, at, at + vec2(10.0, 0.0));
+        assert_eq!(h.px(165, 40), [255, 0, 0, 255], "copiou o vermelho");
+        // o deslocamento fica para os próximos traços (alinhado)
+        let at2 = h.screen(160.0, 140.0);
+        paint_screen(&mut h, at2, at2 + vec2(10.0, 0.0));
+        // origem = y 140 - 0 = 140?  o deslocamento é (-120, 0): vem de y=140 (branco), então pinta branco
+        assert_eq!(h.px(165, 140), [255, 255, 255, 255]);
+        // tecla H escolhe a ferramenta
+        h.app.st.tool = Tool::Brush;
+        h.frame(vec![Event::Key {
+            key: Key::H,
+            physical_key: Some(Key::H),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        assert_eq!(h.app.st.tool, Tool::Clone);
+    }
+
+    #[test]
+    fn histogram_docker_computes_once_per_change_and_not_while_painting() {
+        let mut h = Harness::new();
+        let ctx = egui::Context::default();
+        let run = |st: &mut State| {
+            let raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))),
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| docks::histogram(st, ui));
+            })
+            .drop_without_applying_deltas();
+        };
+        let mut st = std::mem::replace(&mut h.app.st, PaintApp::empty().st);
+        run(&mut st);
+        let (rev, _, hist) = st.docs[0].histogram.clone().expect("calculou");
+        assert_eq!(hist.counted, 300 * 200);
+        assert_eq!(hist.r[255], 300 * 200, "branco puro");
+        // sem mudar nada, o resultado em cache vale
+        run(&mut st);
+        assert_eq!(st.docs[0].histogram.as_ref().unwrap().0, rev);
+        // pintando: não recalcula no meio do traço
+        let d = &mut st.docs[0];
+        let id = d.active;
+        d.ed.fill_selection(id, [0, 0, 0]).ok();
+        st.interaction = Some(crate::state::Interaction::Stroke);
+        st.docs[0].histogram.as_mut().unwrap().1 -= std::time::Duration::from_secs(5);
+        run(&mut st);
+        assert_eq!(
+            st.docs[0].histogram.as_ref().unwrap().2.r[255],
+            300 * 200,
+            "ainda o antigo"
+        );
+        // solto o mouse: atualiza
+        st.interaction = None;
+        st.docs[0].ed.select_all();
+        let id = st.docs[0].active;
+        st.docs[0].ed.fill_selection(id, [0, 0, 0]).unwrap();
+        st.docs[0].histogram.as_mut().unwrap().1 -= std::time::Duration::from_secs(5);
+        run(&mut st);
+        assert_eq!(st.docs[0].histogram.as_ref().unwrap().2.r[0], 300 * 200);
+        // sem documento: não quebra
+        st.docs.clear();
+        run(&mut st);
+    }
+
+    #[test]
+    fn reference_panel_picks_colors_from_its_image() {
+        let mut h = Harness::new();
+        let mut img = image::RgbaImage::new(2, 1);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        img.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+        h.app.st.reference = Some(crate::state::Reference {
+            name: "teste.png".into(),
+            img,
+            tex: None,
+        });
+        let ctx = egui::Context::default();
+        let run = |st: &mut State, events: Vec<Event>| {
+            let raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| docks::reference(st, ui));
+            })
+            .drop_without_applying_deltas();
+        };
+        let mut st = std::mem::replace(&mut h.app.st, PaintApp::empty().st);
+        let click = |p: Pos2| {
+            vec![
+                Event::PointerMoved(p),
+                Event::PointerButton {
+                    pos: p,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::PointerButton {
+                    pos: p,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+        run(&mut st, vec![]);
+        run(&mut st, vec![]);
+        run(&mut st, click(pos2(30.0, 30.0)));
+        assert_eq!(st.fg, [255, 0, 0], "esquerda é vermelha");
+        run(&mut st, vec![]);
+        run(&mut st, click(pos2(360.0, 30.0)));
+        assert_eq!(st.fg, [0, 0, 255], "direita é azul");
+        // sem imagem mostra o convite e não quebra
+        st.reference = None;
+        run(&mut st, vec![]);
+    }
+
+    #[test]
+    fn radial_symmetry_paints_the_repeated_strokes() {
+        let mut h = Harness::new();
+        h.app.st.brush = Brush {
+            size: 14.0,
+            hardness: 1.0,
+            ..Brush::basic()
+        };
+        h.app.st.fg = [0, 0, 255];
+        h.app.st.tool = Tool::Brush;
+        h.app.st.symmetry = 4;
+        // documento 300x200: centro (150,100); toque a 60 px à direita
+        let at = h.screen(210.0, 100.0);
+        paint_screen(&mut h, at, at + vec2(0.5, 0.0));
+        assert!(h.px(210, 100)[0] < 60);
+        assert!(h.px(150, 160)[0] < 60, "90°");
+        assert!(h.px(90, 100)[0] < 60, "180°");
+        assert!(h.px(150, 40)[0] < 60, "270°");
+        assert!(h.px(180, 130)[0] > 200, "entre as cópias não pinta");
+    }
+
+    #[test]
+    fn wrap_mode_toggles_with_shift_w_and_paints_across_the_edge() {
+        let mut h = Harness::new();
+        h.app.st.brush = Brush {
+            size: 30.0,
+            hardness: 1.0,
+            ..Brush::basic()
+        };
+        h.app.st.fg = [0, 0, 255];
+        h.app.st.tool = Tool::Brush;
+        assert!(!h.app.st.wrap);
+        h.frame(vec![Event::Key {
+            key: Key::W,
+            physical_key: Some(Key::W),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        }]);
+        assert!(h.app.st.wrap, "Shift+W liga o mosaico");
+        assert_eq!(h.app.st.tool, Tool::Brush, "e não troca para a varinha");
+        let at = h.screen(295.0, 100.0);
+        paint_screen(&mut h, at, at + vec2(0.5, 0.0));
+        assert!(h.px(295, 100)[0] < 60, "pintou onde clicou");
+        assert!(h.px(3, 100)[0] < 60, "e do outro lado");
+        assert!(h.px(150, 100)[0] > 200, "meio intacto");
+    }
+
+    #[test]
+    fn adjustment_layers_are_created_cancelled_and_edited_from_the_dialog() {
+        let mut h = Harness::new();
+        let base = h.app.st.doc().unwrap().active;
+        let layers = |h: &Harness| h.app.st.doc().unwrap().ed.doc().layers.len();
+        // inverter vale na hora, sem diálogo
+        new_adjustment(&mut h.app.st, Filter::Invert);
+        assert_eq!(layers(&h), 2);
+        assert!(h.app.st.dialog.is_none());
+        assert_eq!(
+            h.app
+                .st
+                .doc()
+                .unwrap()
+                .ed
+                .doc()
+                .layer(base)
+                .unwrap()
+                .pixels
+                .pixel(10, 10)[0],
+            255,
+            "a camada de baixo não muda"
+        );
+        let flat = |h: &Harness| {
+            pawpaint_core::composite::flatten(h.app.st.doc().unwrap().ed.doc())
+                .get_pixel(10, 10)
+                .0
+        };
+        assert_eq!(flat(&h), [0, 0, 0, 255], "mas o resultado fica invertido");
+        // níveis abre o diálogo; Esc desfaz a criação inteira
+        h.app.st.doc_mut().unwrap().active = base;
+        new_adjustment(
+            &mut h.app.st,
+            Filter::Levels {
+                black: 0.0,
+                white: 1.0,
+                gamma: 1.0,
+            },
+        );
+        assert_eq!(layers(&h), 3);
+        assert!(h.app.st.dialog.is_some() && h.app.st.new_adjust == Some(base));
+        h.frame(vec![]);
+        h.frame(vec![Event::Key {
+            key: Key::Escape,
+            physical_key: Some(Key::Escape),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        h.frame(vec![]);
+        assert!(h.app.st.dialog.is_none());
+        assert_eq!(layers(&h), 2, "cancelar tira a camada nova");
+        assert_eq!(h.app.st.doc().unwrap().active, base);
+        // editar um ajuste existente abre o diálogo com os valores dele (sem criar camada)
+        h.app.st.doc_mut().unwrap().active = base;
+        new_adjustment(&mut h.app.st, Filter::Threshold(0.3));
+        let id = h.app.st.doc().unwrap().active;
+        h.app.st.dialog = None;
+        h.app.st.new_adjust = None;
+        edit_adjustment(&mut h.app.st, id);
+        match &h.app.st.dialog {
+            Some(Dialog::Filter { kind, a, .. }) => {
+                assert!(matches!(kind, FilterKind::Threshold));
+                assert!((*a - 0.3).abs() < 1e-6);
+            }
+            _ => panic!("esperava o diálogo de limiar"),
+        }
+        assert!(h.app.st.new_adjust.is_none());
+    }
+
+    #[test]
+    fn pen_pressure_from_touch_events_thins_the_stroke() {
+        use pawpaint_core::brush::Sensor;
+        let width_with = |force: f32| {
+            let mut h = Harness::new();
+            let mut b = Brush {
+                size: 24.0,
+                hardness: 1.0,
+                spacing: 0.05,
+                ..Brush::basic()
+            };
+            b.dynamics.size = Sensor::Pressure;
+            b.dynamics.size_min = 0.1;
+            h.app.st.brush = b;
+            h.app.st.fg = [0, 0, 0];
+            h.app.st.tool = Tool::Brush;
+            let touch = |h: &Harness, x: f32, y: f32, phase: egui::TouchPhase| Event::Touch {
+                device_id: egui::TouchDeviceId(0),
+                id: egui::TouchId(1),
+                phase,
+                pos: h.screen(x, y),
+                force: Some(force),
+            };
+            h.mv(40.0, 100.0);
+            let e = touch(&h, 40.0, 100.0, egui::TouchPhase::Start);
+            h.frame(vec![e]);
+            h.button(40.0, 100.0, true, Modifiers::NONE);
+            for i in 1..=8 {
+                let x = 40.0 + i as f32 * 25.0;
+                let e = touch(&h, x, 100.0, egui::TouchPhase::Move);
+                h.frame(vec![e]);
+                h.mv(x, 100.0);
+            }
+            h.button(240.0, 100.0, false, Modifiers::NONE);
+            let e = touch(&h, 240.0, 100.0, egui::TouchPhase::End);
+            h.frame(vec![e]);
+            h.frame(vec![]);
+            // espessura do traço na coluna 140
+            (0..200)
+                .filter(|y| h.px(140, *y)[3] > 128 && h.px(140, *y)[0] < 128)
+                .count()
+        };
+        let (soft, firm) = (width_with(0.1), width_with(1.0));
+        assert!(firm >= 20, "pressão total: {firm}");
+        assert!(
+            soft * 2 < firm,
+            "pressão leve fica bem mais fina: {soft} vs {firm}"
+        );
     }
 
     #[test]

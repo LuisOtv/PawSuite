@@ -163,6 +163,28 @@ enum Dialog {
         treble: f32,
     },
     Limiter(f32),
+    /// Cria rótulos nos trechos com som (fala) da faixa selecionada.
+    LabelSounds {
+        threshold: f32,
+        min_silence: f32,
+        min_sound: f32,
+        text: String,
+    },
+    /// Rótulos em cada trecho estourado.
+    MarkClipping {
+        level: f32,
+        min_run: u32,
+    },
+    /// A música (faixas selecionadas) abaixa quando a faixa de controle fala.
+    Duck {
+        control: u64,
+        threshold: f32,
+        amount: f32,
+        attack: f32,
+        release: f32,
+    },
+    /// Efeitos extras (equalizador, reverb, tempo…): ver `fx_dialogs`.
+    Fx(crate::fx_dialogs::FxDialog),
     DeEss {
         threshold: f32,
         reduction: f32,
@@ -178,6 +200,20 @@ enum Dialog {
 enum AfterDiscard {
     New,
     Open(PathBuf),
+}
+
+/// Número da batida na régua de compassos: "3" no primeiro tempo do compasso 3, "3.2" no segundo.
+pub fn beat_label(beat_index: i64, per_bar: u32) -> String {
+    let per_bar = per_bar.max(1) as i64;
+    let (bar, beat) = (
+        beat_index.div_euclid(per_bar) + 1,
+        beat_index.rem_euclid(per_bar) + 1,
+    );
+    if beat == 1 {
+        format!("{bar}")
+    } else {
+        format!("{bar}.{beat}")
+    }
 }
 
 /// O que um arrasto no painel das faixas está fazendo.
@@ -221,6 +257,18 @@ struct SpecCache {
     cols: usize,
 }
 
+/// Fábrica de efeitos: cada chamada devolve uma cópia nova pronta para aplicar.
+type EffectMaker = std::sync::Arc<dyn Fn() -> crate::fx_dialogs::Job + Send + Sync>;
+
+/// O último efeito aplicado, para "Repetir último efeito" (Ctrl+R).
+#[derive(Clone)]
+struct LastEffect {
+    label: &'static str,
+    resize: bool,
+    /// Faz uma cópia nova do efeito a cada uso.
+    make: EffectMaker,
+}
+
 /// Efeito que está sendo calculado fora da thread da interface.
 struct EffectJob {
     label: &'static str,
@@ -258,11 +306,18 @@ pub struct VoiceApp {
     player: Player,
     /// Efeito demorado rodando em outra thread.
     effect: Option<EffectJob>,
+    last_effect: Option<LastEffect>,
+    /// Transcrição (whisper) rodando em outra thread.
+    transcription: Option<Receiver<Result<String, String>>>,
     /// Uma reprodução foi iniciada e ainda não foi vista terminar (para repetir em loop).
     play_active: bool,
     /// Revisão da sessão que o player está tocando: se mudar, troca a mixagem ao vivo.
     play_rev: u64,
     pub looping: bool,
+    /// Região de repetição (como a do Audacity): com o loop ligado, toca só ela.
+    pub loop_region: Option<(usize, usize)>,
+    /// Régua em compassos: andamento (bpm) e tempos por compasso; `None` = minutos e segundos.
+    pub ruler_beats: Option<(f32, u32)>,
     recorder: Recorder,
     audio: AudioSettings,
     inputs: Vec<Device>,
@@ -465,6 +520,23 @@ impl VoiceApp {
         theme::apply(ctx);
         let mut app = Self::empty();
         app.screenshot = std::env::var_os("PAWVOICE_SCREENSHOT").map(PathBuf::from);
+        // Para os testes visuais: `PAWVOICE_DIALOG=equalizer` abre esse diálogo logo de cara.
+        if let Ok(name) = std::env::var("PAWVOICE_DIALOG") {
+            use crate::fx_dialogs::FxDialog;
+            app.dialog = match name.as_str() {
+                "equalizer" => Some(Dialog::Fx(FxDialog::equalizer())),
+                "reverb" => Some(Dialog::Fx(FxDialog::reverb())),
+                "tempo" => Some(Dialog::Fx(FxDialog::Tempo(1.1))),
+                "duck" => Some(Dialog::Duck {
+                    control: 0,
+                    threshold: -35.0,
+                    amount: 12.0,
+                    attack: 80.0,
+                    release: 600.0,
+                }),
+                _ => None,
+            };
+        }
         app.toasts.bottom_margin = 64.0;
         app.audio = std::fs::read_to_string(settings_path())
             .ok()
@@ -504,9 +576,13 @@ impl VoiceApp {
             label_edit: None,
             player: Player::spawn(RATE, 2),
             effect: None,
+            last_effect: None,
+            transcription: None,
             play_active: false,
             play_rev: 0,
             looping: false,
+            loop_region: None,
+            ruler_beats: None,
             recorder: Recorder::new(RATE),
             audio: AudioSettings::default(),
             inputs: Vec::new(),
@@ -747,12 +823,35 @@ impl VoiceApp {
     pub fn apply_effect(
         &mut self,
         label: &'static str,
-        mut f: impl FnMut(&mut [Vec<f32>]) + Send + 'static,
+        f: impl FnMut(&mut [Vec<f32>]) + Send + Clone + 'static,
+    ) {
+        self.apply_effect_ex(label, false, f);
+    }
+
+    /// Como `apply_effect`; com `resize` o efeito pode mudar a duração do trecho (o resto da
+    /// faixa anda junto).
+    pub fn apply_effect_ex(
+        &mut self,
+        label: &'static str,
+        resize: bool,
+        mut f: impl FnMut(&mut [Vec<f32>]) + Send + Clone + 'static,
     ) {
         self.stop();
         if self.effect.is_some() {
             return;
         }
+        let proto = std::sync::Mutex::new(f.clone());
+        self.last_effect = Some(LastEffect {
+            label,
+            resize,
+            make: std::sync::Arc::new(move || {
+                let copy = proto
+                    .lock()
+                    .map(|p| p.clone())
+                    .unwrap_or_else(|e| e.into_inner().clone());
+                Box::new(copy)
+            }),
+        });
         let Some((tracks, a, b)) = self.target() else {
             self.warn("Grave ou importe áudio primeiro");
             return;
@@ -765,7 +864,11 @@ impl VoiceApp {
             }
         };
         if job.samples() <= INLINE_EFFECT_SAMPLES {
-            job.run(&mut f);
+            if resize {
+                job.run_resize(&mut f);
+            } else {
+                job.run(&mut f);
+            }
             self.finish_effect(job, label);
             return;
         }
@@ -773,7 +876,11 @@ impl VoiceApp {
         std::thread::Builder::new()
             .name("pawvoice-effect".into())
             .spawn(move || {
-                job.run(f);
+                if resize {
+                    job.run_resize(f);
+                } else {
+                    job.run(f);
+                }
                 let _ = tx.send(job);
             })
             .expect("não foi possível criar a thread do efeito");
@@ -784,13 +891,102 @@ impl VoiceApp {
         });
     }
 
+    /// Aplica de novo o último efeito (Ctrl+R), na seleção de agora.
+    pub fn repeat_last_effect(&mut self) {
+        let Some(last) = self.last_effect.clone() else {
+            self.warn("Ainda não aplicou nenhum efeito");
+            return;
+        };
+        let make = last.make.clone();
+        self.apply_effect_ex(last.label, last.resize, move |p| (make())(p));
+    }
+
     fn finish_effect(&mut self, job: pawvoice_core::ProcessJob, label: &'static str) {
+        let resized = job.is_resized();
         if let Err(e) = self.ed.finish_process(job, label) {
             self.warn(e.to_string());
+        } else if resized {
+            // A seleção de antes não vale mais (o trecho mudou de tamanho).
+            self.sel = None;
+            self.clip_sel.clear();
         }
     }
 
     /// Recolhe o efeito que terminou.
+    /// Transcreve a primeira faixa selecionada com o whisper instalado; cada fala vira um rótulo.
+    pub fn start_transcription(&mut self, lang: &str) {
+        if self.transcription.is_some() {
+            self.warn("Já está transcrevendo");
+            return;
+        }
+        let engine = match paw_audio::whisper::detect() {
+            Ok(e) => e,
+            Err(msg) => {
+                self.warn(msg);
+                return;
+            }
+        };
+        let Some(id) = self.sel_tracks().first().copied() else {
+            self.warn("Selecione uma faixa");
+            return;
+        };
+        let planar = self.ed.render(id);
+        let mono = effects::mono_max_signed(&planar);
+        if mono.is_empty() {
+            self.warn("A faixa está vazia");
+            return;
+        }
+        let (tx, rx) = channel();
+        let lang = lang.to_string();
+        let label = engine.label();
+        std::thread::spawn(move || {
+            let dir = std::env::temp_dir().join(format!("pawvoice-whisper-{}", std::process::id()));
+            let wav = dir.join("fala.wav");
+            let result = std::fs::create_dir_all(&dir)
+                .and_then(|_| paw_audio::whisper::write_wav16k(&wav, &mono, RATE))
+                .map_err(|e| e.to_string())
+                .and_then(|_| paw_audio::whisper::transcribe(&engine, &wav, &lang, &dir));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = tx.send(result);
+        });
+        self.transcription = Some(rx);
+        self.say(format!("Transcrevendo com {label}… pode levar um tempo"));
+    }
+
+    fn poll_transcription(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.transcription else {
+            return;
+        };
+        match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(300))
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.transcription = None;
+                self.warn("A transcrição foi interrompida");
+            }
+            Ok(result) => {
+                self.transcription = None;
+                match result {
+                    Err(e) => self.warn(e),
+                    Ok(text) => self.finish_transcription(&text),
+                }
+            }
+        }
+    }
+
+    /// As falas do SRT viram rótulos (um passo de desfazer).
+    pub fn finish_transcription(&mut self, srt: &str) {
+        let items: Vec<(usize, usize, String)> = paw_audio::whisper::parse_srt(srt)
+            .into_iter()
+            .map(|(a, b, t)| ((a * RATE as f64) as usize, (b * RATE as f64) as usize, t))
+            .collect();
+        match self.ed.add_labels(true, &items, "Transcrever") {
+            Ok(_) => self.say(format!("{} fala(s) rotulada(s)", items.len())),
+            Err(_) => self.warn("O whisper não achou fala nenhuma"),
+        }
+    }
+
     fn poll_effect(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.effect else { return };
         match job.rx.try_recv() {
@@ -917,6 +1113,110 @@ impl VoiceApp {
         self.clip_sel.clear();
     }
 
+    /// Um rótulo em cada trecho com som da primeira faixa selecionada.
+    pub fn label_sounds(&mut self, threshold: f32, min_silence: f32, min_sound: f32, text: &str) {
+        let Some(id) = self.sel_tracks().first().copied() else {
+            self.warn("Selecione uma faixa");
+            return;
+        };
+        let p = self.ed.render(id);
+        let ranges = effects::sound_ranges(
+            &effects::mono_max(&p),
+            RATE,
+            threshold,
+            min_silence,
+            min_sound,
+        );
+        let items: Vec<(usize, usize, String)> = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, (a, b))| (*a, *b, format!("{text} {}", i + 1)))
+            .collect();
+        match self.ed.add_labels(true, &items, "Rotular falas") {
+            Ok(_) => self.say(format!("{} trecho(s) rotulado(s)", items.len())),
+            Err(_) => self.say("Nenhum trecho com som encontrado"),
+        }
+    }
+
+    /// Um rótulo em cada trecho estourado da faixa selecionada (ou de todas).
+    pub fn mark_clipping(&mut self, level: f32, min_run: usize) {
+        let mut items = Vec::new();
+        for id in self.sel_tracks() {
+            let name = self
+                .ed
+                .session()
+                .track(id)
+                .map_or(String::new(), |t| t.name.clone());
+            for ch in self.ed.render(id) {
+                for (a, b) in paw_audio::fx::find_clipping(&ch, level, min_run) {
+                    items.push((a, b, format!("Estouro ({name})")));
+                }
+            }
+        }
+        items.sort_by_key(|i| i.0);
+        items.dedup_by_key(|i| (i.0, i.1));
+        match self.ed.add_labels(true, &items, "Marcar estouros") {
+            Ok(_) => self.say(format!("{} estouro(s) marcado(s)", items.len())),
+            Err(_) => self.say("Nenhum estouro encontrado"),
+        }
+    }
+
+    /// A música (faixas selecionadas, menos a de controle) abaixa quando a voz fala.
+    pub fn auto_duck(
+        &mut self,
+        control: u64,
+        threshold: f32,
+        amount: f32,
+        attack: f32,
+        release: f32,
+    ) {
+        let music: Vec<u64> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|id| *id != control)
+            .collect();
+        if music.is_empty() {
+            self.warn("Selecione a faixa da música (e escolha a da voz como controle)");
+            return;
+        }
+        let Some((_, a, b)) = self.target() else {
+            return;
+        };
+        let voice = effects::mono_max(&self.ed.render_range(control, a, b));
+        let keep = std::mem::replace(&mut self.selected, music);
+        self.apply_effect("Auto-duck", move |p| {
+            for ch in p.iter_mut() {
+                paw_audio::fx::duck(ch, &voice, RATE, threshold, amount, attack, release);
+            }
+        });
+        self.selected = keep;
+    }
+
+    /// Crossfade entre duas faixas selecionadas: uma sai enquanto a outra entra no trecho
+    /// escolhido (`top_out`: a de cima sai e a de baixo entra; senão o contrário).
+    pub fn crossfade_tracks(&mut self, top_out: bool) {
+        if self.sel_tracks().len() != 2 {
+            self.warn("Selecione exatamente duas faixas e o trecho do crossfade");
+            return;
+        }
+        // na ordem da tela, não na ordem dos cliques
+        let order = self.track_ids();
+        let mut sel = self.sel_tracks();
+        sel.sort_by_key(|id| order.iter().position(|o| o == id));
+        let keep = std::mem::replace(&mut self.selected, sel);
+        let mut call = 0;
+        self.apply_effect("Crossfade de faixas", move |p| {
+            // um trecho por faixa, na ordem da tela
+            let fade_in = (call == 1) == top_out;
+            call += 1;
+            for ch in p.iter_mut() {
+                paw_audio::dsp::fade(ch, fade_in);
+            }
+        });
+        self.selected = keep;
+    }
+
     pub fn remove_silences(&mut self, threshold: f32, min: f32) {
         self.stop();
         let mut total = 0;
@@ -1034,9 +1334,10 @@ impl VoiceApp {
             return;
         }
         let len = self.ed.session().len();
-        let (from, to) = match self.sel {
-            Some((a, b)) => (a, b),
-            None => (if self.cursor >= len { 0 } else { self.cursor }, len),
+        let (from, to) = match (self.looping.then_some(self.loop_region).flatten(), self.sel) {
+            (Some((a, b)), _) => (a, b.min(len)),
+            (None, Some((a, b))) => (a, b),
+            (None, None) => (if self.cursor >= len { 0 } else { self.cursor }, len),
         };
         self.play_range(from, to);
     }
@@ -1138,8 +1439,10 @@ impl VoiceApp {
             self.play_active = false;
             if self.looping {
                 let len = self.ed.session().len();
-                let (a, b) = self.sel.unwrap_or((self.cursor.min(len), len));
-                self.play_range(a, b);
+                let (a, b) = self
+                    .loop_region
+                    .unwrap_or_else(|| self.sel.unwrap_or((self.cursor.min(len), len)));
+                self.play_range(a, b.min(len));
             }
         }
     }
@@ -1589,6 +1892,9 @@ impl VoiceApp {
         if pressed(ctrl, Key::B) {
             self.add_label_here();
         }
+        if pressed(ctrl, Key::R) {
+            self.repeat_last_effect();
+        }
         if pressed(Modifiers::COMMAND | Modifiers::ALT, Key::I) {
             self.split_new();
         }
@@ -1876,6 +2182,36 @@ impl VoiceApp {
                     self.fit();
                 }
                 ui.separator();
+                ui.menu_button("Régua", |ui| {
+                    if ui
+                        .selectable_label(self.ruler_beats.is_none(), "Minutos e segundos")
+                        .clicked()
+                    {
+                        self.ruler_beats = None;
+                    }
+                    let on = self.ruler_beats.is_some();
+                    if ui.selectable_label(on, "Compassos e batidas").clicked() && !on {
+                        self.ruler_beats = Some((120.0, 4));
+                    }
+                    if let Some((bpm, per_bar)) = &mut self.ruler_beats {
+                        theme::fixed_width(ui, theme::NUM_W + 20.0, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(bpm)
+                                        .range(30.0..=300.0)
+                                        .speed(0.5)
+                                        .max_decimals(1)
+                                        .suffix(" bpm"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(per_bar)
+                                        .range(1..=12)
+                                        .suffix(" tempos"),
+                                );
+                            });
+                        });
+                    }
+                });
                 ui.checkbox(&mut self.show_script, "Roteiro e teleprompter");
             });
             ui.menu_button("Transporte", |ui| {
@@ -1897,6 +2233,32 @@ impl VoiceApp {
                 }
                 ui.separator();
                 ui.checkbox(&mut self.looping, "Repetir (loop)");
+                ui.menu_button("Região de loop", |ui| {
+                    let sel = self.sel;
+                    if item(ui, "Definir pela seleção", "", sel.is_some()) {
+                        ui.close();
+                        self.loop_region = sel;
+                        self.looping = true;
+                    }
+                    if item(
+                        ui,
+                        "Selecionar a região de loop",
+                        "",
+                        self.loop_region.is_some(),
+                    ) {
+                        ui.close();
+                        self.sel = self.loop_region;
+                    }
+                    if item(ui, "Limpar a região", "", self.loop_region.is_some()) {
+                        ui.close();
+                        self.loop_region = None;
+                    }
+                    ui.label(
+                        RichText::new("Shift + arrastar na régua também define")
+                            .weak()
+                            .small(),
+                    );
+                });
                 ui.checkbox(&mut self.overdub, "Tocar as outras faixas enquanto grava");
                 let mon = self.recorder.is_monitoring();
                 if item(
@@ -1961,6 +2323,34 @@ impl VoiceApp {
                     ui.close();
                     self.ed.add_label_track();
                 }
+                ui.menu_button("Gerar", |ui| {
+                    use crate::fx_dialogs::{FxDialog, Gen};
+                    use paw_audio::fx::NoiseKind;
+                    if ui.button("Tom…").clicked() {
+                        ui.close();
+                        self.dialog = Some(Dialog::Fx(FxDialog::Generate(Gen::Tone {
+                            hz: 440.0,
+                            secs: 5.0,
+                            amp: 0.5,
+                        })));
+                    }
+                    if ui.button("Ruído…").clicked() {
+                        ui.close();
+                        self.dialog = Some(Dialog::Fx(FxDialog::Generate(Gen::Noise {
+                            kind: NoiseKind::Pink,
+                            secs: 5.0,
+                            amp: 0.3,
+                        })));
+                    }
+                    if ui.button("Metrônomo…").clicked() {
+                        ui.close();
+                        self.dialog = Some(Dialog::Fx(FxDialog::Generate(Gen::Clicks {
+                            bpm: 120.0,
+                            beats: 4,
+                            bars: 8,
+                        })));
+                    }
+                });
                 if item(
                     ui,
                     "Apagar faixas selecionadas",
@@ -2014,117 +2404,258 @@ impl VoiceApp {
                 let t = self.lufs_target;
                 self.apply_effect("Melhorar voz", move |p| effects::enhance_voice(p, RATE, t));
             }
-            ui.separator();
-            ui.label(RichText::new("Volume").weak().small());
-            ui.horizontal(|ui| {
-                if ui.button("Normalizar loudness").clicked() {
+            if ui
+                .add_enabled(
+                    self.last_effect.is_some(),
+                    egui::Button::new("Repetir último efeito").shortcut_text("Ctrl+R"),
+                )
+                .clicked()
+            {
+                ui.close();
+                self.repeat_last_effect();
+            }
+            ui.menu_button("Volume", |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Normalizar loudness").clicked() {
+                        ui.close();
+                        let t = self.lufs_target;
+                        self.apply_effect("Normalizar loudness", move |p| {
+                            effects::loudness(p, RATE, t);
+                        });
+                    }
+                    theme::fixed_width(ui, theme::NUM_W + 20.0, |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.lufs_target)
+                                .range(-30.0..=-6.0)
+                                .speed(0.2)
+                                .suffix(" LUFS"),
+                        )
+                        .on_hover_text("−14 YouTube · −16 narração/podcast · −23 TV")
+                    });
+                });
+                if ui.button("Normalizar (pico −1 dB)").clicked() {
                     ui.close();
-                    let t = self.lufs_target;
-                    self.apply_effect("Normalizar loudness", move |p| {
-                        effects::loudness(p, RATE, t);
+                    self.apply_effect("Normalizar", effects::peak_normalize);
+                }
+                if ui.button("Amplificar…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Gain(3.0));
+                }
+                if ui.button("Compressor…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Compressor(Compression::Medium));
+                }
+                if ui.button("De-esser (tira o chiado do S)…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::DeEss {
+                        threshold: -32.0,
+                        reduction: 10.0,
                     });
                 }
-                theme::fixed_width(ui, theme::NUM_W + 20.0, |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut self.lufs_target)
-                            .range(-30.0..=-6.0)
-                            .speed(0.2)
-                            .suffix(" LUFS"),
-                    )
-                    .on_hover_text("−14 YouTube · −16 narração/podcast · −23 TV")
-                });
+                if ui.button("Limitador…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Limiter(-1.0));
+                }
+                let has_sel = self.sel.is_some();
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Fade in"))
+                    .on_disabled_hover_text("Selecione o trecho do fade")
+                    .clicked()
+                {
+                    ui.close();
+                    self.apply_effect("Fade in", move |p| effects::each(p, |s| dsp::fade(s, true)));
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Fade out"))
+                    .on_disabled_hover_text("Selecione o trecho do fade")
+                    .clicked()
+                {
+                    ui.close();
+                    self.apply_effect("Fade out", move |p| {
+                        effects::each(p, |s| dsp::fade(s, false))
+                    });
+                }
             });
-            if ui.button("Normalizar (pico −1 dB)").clicked() {
-                ui.close();
-                self.apply_effect("Normalizar", effects::peak_normalize);
-            }
-            if ui.button("Amplificar…").clicked() {
-                ui.close();
-                self.dialog = Some(Dialog::Gain(3.0));
-            }
-            if ui.button("Compressor…").clicked() {
-                ui.close();
-                self.dialog = Some(Dialog::Compressor(Compression::Medium));
-            }
-            if ui.button("De-esser (tira o chiado do S)…").clicked() {
-                ui.close();
-                self.dialog = Some(Dialog::DeEss {
-                    threshold: -32.0,
-                    reduction: 10.0,
-                });
-            }
-            if ui.button("Limitador…").clicked() {
-                ui.close();
-                self.dialog = Some(Dialog::Limiter(-1.0));
-            }
-            let has_sel = self.sel.is_some();
-            if ui
-                .add_enabled(has_sel, egui::Button::new("Fade in"))
-                .on_disabled_hover_text("Selecione o trecho do fade")
-                .clicked()
-            {
-                ui.close();
-                self.apply_effect("Fade in", move |p| effects::each(p, |s| dsp::fade(s, true)));
-            }
-            if ui
-                .add_enabled(has_sel, egui::Button::new("Fade out"))
-                .on_disabled_hover_text("Selecione o trecho do fade")
-                .clicked()
-            {
-                ui.close();
-                self.apply_effect("Fade out", move |p| {
-                    effects::each(p, |s| dsp::fade(s, false))
-                });
-            }
-            ui.separator();
-            ui.label(RichText::new("Ruído e timbre").weak().small());
-            if ui.button("Redução de ruído…").clicked() {
-                ui.close();
-                self.dialog = Some(Dialog::NoiseReduction {
-                    reduction: 12.0,
-                    sensitivity: 6.0,
-                });
-            }
-            if ui.button("Noise gate (chiado nas pausas)…").clicked() {
-                ui.close();
-                let floor = self
-                    .target()
-                    .and_then(|(tracks, a, b)| {
-                        let p = self.ed.render_range(*tracks.first()?, a, b);
-                        p.first().map(|c| dsp::noise_floor_db(c, RATE))
-                    })
-                    .unwrap_or(-60.0);
-                self.dialog = Some(Dialog::Gate {
-                    threshold: (floor + 8.0).clamp(-80.0, -10.0),
-                    reduction: 18.0,
-                });
-            }
-            if ui.button("Filtro passa-altas 80 Hz (tira ronco)").clicked() {
-                ui.close();
-                self.apply_effect("Passa-altas", move |p| {
-                    effects::each(p, |s| dsp::high_pass(s, RATE, 80.0))
-                });
-            }
-            if ui.button("Graves e agudos…").clicked() {
-                ui.close();
-                self.dialog = Some(Dialog::BassTreble {
-                    bass: 0.0,
-                    treble: 0.0,
-                });
-            }
-            ui.separator();
-            ui.label(RichText::new("Tempo").weak().small());
-            if ui.button("Truncar silêncio…").clicked() {
-                ui.close();
-                self.dialog = Some(Dialog::Silences {
-                    threshold: -40.0,
-                    min: 0.6,
-                });
-            }
-            if ui.button("Inverter (de trás para frente)").clicked() {
-                ui.close();
-                self.apply_effect("Inverter", move |p| effects::each(p, |s| s.reverse()));
-            }
+            ui.menu_button("Ruído e timbre", |ui| {
+                if ui.button("Redução de ruído…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::NoiseReduction {
+                        reduction: 12.0,
+                        sensitivity: 6.0,
+                    });
+                }
+                if ui.button("Noise gate (chiado nas pausas)…").clicked() {
+                    ui.close();
+                    let floor = self
+                        .target()
+                        .and_then(|(tracks, a, b)| {
+                            let p = self.ed.render_range(*tracks.first()?, a, b);
+                            p.first().map(|c| dsp::noise_floor_db(c, RATE))
+                        })
+                        .unwrap_or(-60.0);
+                    self.dialog = Some(Dialog::Gate {
+                        threshold: (floor + 8.0).clamp(-80.0, -10.0),
+                        reduction: 18.0,
+                    });
+                }
+                if ui.button("Filtro passa-altas 80 Hz (tira ronco)").clicked() {
+                    ui.close();
+                    self.apply_effect("Passa-altas", move |p| {
+                        effects::each(p, |s| dsp::high_pass(s, RATE, 80.0))
+                    });
+                }
+                if ui.button("Graves e agudos…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::BassTreble {
+                        bass: 0.0,
+                        treble: 0.0,
+                    });
+                }
+                if ui.button("Equalizador…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::equalizer()));
+                }
+                if ui.button("Notch (zumbido, apito)…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::notch()));
+                }
+                if ui.button("Apagar faixa de frequências…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::SpectralDelete {
+                        lo: 2000.0,
+                        hi: 4000.0,
+                        amount: 40.0,
+                    }));
+                }
+                if ui.button("Reparar áudio estourado…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::Declip(0.97)));
+                }
+                if ui.button("Fade ajustável…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::Fade {
+                        start: 0.0,
+                        end: -40.0,
+                        curve: 0.0,
+                    }));
+                }
+                if ui.button("Tirar voz do centro (karaokê)…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::RemoveCenter));
+                }
+            });
+            ui.menu_button("Espaço e modulação", |ui| {
+                if ui.button("Reverb…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::reverb()));
+                }
+                if ui.button("Tremolo…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::tremolo()));
+                }
+                if ui.button("Phaser…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::phaser()));
+                }
+                if ui.button("Wah-wah…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::wah()));
+                }
+            });
+            ui.menu_button("Tempo e tom", |ui| {
+                if ui.button("Repetir…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::Repeat(2)));
+                }
+                if ui.button("Velocidade…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::Speed(1.25)));
+                }
+                if ui.button("Tempo (sem mudar o tom)…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::Tempo(1.1)));
+                }
+                if ui.button("Tom (sem mudar o tempo)…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::Pitch(2.0)));
+                }
+                if ui
+                    .button("Crossfade: faixa de cima sai, a de baixo entra")
+                    .clicked()
+                {
+                    ui.close();
+                    self.crossfade_tracks(true);
+                }
+                if ui
+                    .button("Crossfade: faixa de baixo sai, a de cima entra")
+                    .clicked()
+                {
+                    ui.close();
+                    self.crossfade_tracks(false);
+                }
+                if ui.button("Auto-duck (música abaixa na voz)…").clicked() {
+                    ui.close();
+                    let control = self
+                        .ed
+                        .session()
+                        .tracks
+                        .iter()
+                        .map(|t| t.id)
+                        .find(|id| !self.selected.contains(id))
+                        .unwrap_or(0);
+                    self.dialog = Some(Dialog::Duck {
+                        control,
+                        threshold: -35.0,
+                        amount: 12.0,
+                        attack: 80.0,
+                        release: 600.0,
+                    });
+                }
+            });
+            ui.menu_button("Análise", |ui| {
+                if ui.button("Rotular falas (um rótulo por trecho)…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::LabelSounds {
+                        threshold: -40.0,
+                        min_silence: 0.5,
+                        min_sound: 0.3,
+                        text: "Fala".into(),
+                    });
+                }
+                if ui
+                    .add_enabled(
+                        self.transcription.is_none(),
+                        egui::Button::new("Transcrever a fala em rótulos (whisper)"),
+                    )
+                    .on_hover_text(
+                        "Precisa do whisper instalado; cada fala vira um rótulo com o texto",
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.start_transcription("pt");
+                }
+                if ui.button("Marcar áudio estourado…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::MarkClipping {
+                        level: 0.99,
+                        min_run: 3,
+                    });
+                }
+            });
+            ui.menu_button("Pausas", |ui| {
+                if ui.button("Truncar silêncio…").clicked() {
+                    ui.close();
+                    self.dialog = Some(Dialog::Silences {
+                        threshold: -40.0,
+                        min: 0.6,
+                    });
+                }
+                if ui.button("Inverter (de trás para frente)").clicked() {
+                    ui.close();
+                    self.apply_effect("Inverter", move |p| effects::each(p, |s| s.reverse()));
+                }
+            });
         }
     }
 
@@ -2243,16 +2774,14 @@ impl VoiceApp {
                 self.tool = Tool::Envelope;
             }
             sep(ui);
-            let (g, _) = ui.allocate_exact_size(vec2(18.0, 28.0), Sense::hover());
-            icons::paint(
-                ui.painter(),
-                Rect::from_center_size(g.center(), vec2(16.0, 16.0)),
+            let gear = icons::button(
+                ui,
                 Icon::Gear,
-                theme::TEXT,
+                16.0,
+                false,
+                "Configuração de áudio: microfone, canais de gravação (mono/estéreo) e saída",
             );
-            ui.menu_button("Configuração de áudio", |ui| self.audio_setup_menu(ui))
-                .response
-                .on_hover_text("Microfone, canais de gravação (mono/estéreo) e saída");
+            egui::Popup::menu(&gear).show(|ui| self.audio_setup_menu(ui));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 self.meters(ui);
@@ -2516,12 +3045,22 @@ impl VoiceApp {
             theme::BAR,
         );
         let secs_per_px = self.spp / RATE as f64;
-        let step = [
-            0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
-        ]
-        .into_iter()
-        .find(|s| s / secs_per_px >= 80.0)
-        .unwrap_or(600.0);
+        let beat = self
+            .ruler_beats
+            .map(|(bpm, _)| 60.0 / bpm.clamp(20.0, 400.0) as f64);
+        let step = match beat {
+            // Em compassos: 1, 2, 4… tempos entre os números, o que couber.
+            Some(b) => (0..12)
+                .map(|k| b * (1u32 << k) as f64)
+                .find(|s| s / secs_per_px >= 60.0)
+                .unwrap_or(b * 4096.0),
+            None => [
+                0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
+            ]
+            .into_iter()
+            .find(|s| s / secs_per_px >= 80.0)
+            .unwrap_or(600.0),
+        };
         let mut t = (self.view_start / RATE as f64 / step).floor() * step;
         let rp = painter.with_clip_rect(ruler);
         while x_of(t * RATE as f64, self) < area.right() {
@@ -2537,10 +3076,14 @@ impl VoiceApp {
                     Stroke::new(1.0, Color32::from_gray(70)),
                 );
             }
+            let text = match (beat, self.ruler_beats) {
+                (Some(b), Some((_, per_bar))) => beat_label((t / b).round() as i64, per_bar),
+                _ => format_time((t * RATE as f64) as usize, RATE),
+            };
             rp.text(
                 pos2(x + 3.0, ruler.top() + 4.0),
                 Align2::LEFT_TOP,
-                format_time((t * RATE as f64) as usize, RATE),
+                text,
                 theme::mono(10.0),
                 theme::TEXT,
             );
@@ -2556,9 +3099,46 @@ impl VoiceApp {
                 theme::ACCENT.gamma_multiply(0.7),
             );
         }
+        if let Some((a, b)) = self.loop_region {
+            let (xa, xb) = (x_of(a as f64, self), x_of(b as f64, self));
+            let band = Rect::from_min_max(pos2(xa, ruler.top()), pos2(xb, ruler.bottom()));
+            let blue = Color32::from_rgb(90, 150, 230);
+            rp.rect_filled(band, 0.0, blue.gamma_multiply(0.22));
+            for x in [xa, xb] {
+                rp.line_segment(
+                    [pos2(x, ruler.top()), pos2(x, ruler.bottom())],
+                    Stroke::new(1.5, blue),
+                );
+            }
+            // um véu fraco por cima das faixas mostra onde o loop toca
+            painter
+                .with_clip_rect(Rect::from_min_max(
+                    pos2(area.left(), ruler.bottom()),
+                    area.max,
+                ))
+                .rect_filled(
+                    Rect::from_min_max(pos2(xa, ruler.bottom()), pos2(xb, area.bottom())),
+                    0.0,
+                    blue.gamma_multiply(0.06),
+                );
+        }
         let ruler_resp = ui
-            .interact(ruler, ui.id().with("ruler"), Sense::click())
-            .on_hover_text("Clique para tocar a partir daqui");
+            .interact(ruler, ui.id().with("ruler"), Sense::click_and_drag())
+            .on_hover_text("Clique para tocar a partir daqui · Shift + arrastar define o loop");
+        if ruler_resp.dragged()
+            && ui.input(|i| i.modifiers.shift)
+            && let Some(p) = ruler_resp.interact_pointer_pos()
+            && let Some(o) = ui.input(|i| i.pointer.press_origin())
+        {
+            let (x0, x1) = (
+                s_at(o.x, self).max(0.0) as usize,
+                s_at(p.x, self).max(0.0) as usize,
+            );
+            if x0.abs_diff(x1) > 100 {
+                self.loop_region = Some((x0.min(x1), x0.max(x1)));
+                self.looping = true;
+            }
+        }
         if ruler_resp.clicked()
             && let Some(p) = ruler_resp.interact_pointer_pos()
         {
@@ -3409,15 +3989,7 @@ impl VoiceApp {
         in_row(ui, row(0), &mut |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.set_max_width(x1 - x0 - 24.0);
-            if ui
-                .add(
-                    egui::Button::new("×")
-                        .frame(false)
-                        .min_size(vec2(16.0, ROW)),
-                )
-                .on_hover_text("Apagar a faixa")
-                .clicked()
-            {
+            if icons::button(ui, Icon::Close, 12.0, false, "Apagar a faixa").clicked() {
                 remove = true;
             }
             if let Some((rid, text)) = &mut self.renaming
@@ -3643,13 +4215,7 @@ impl VoiceApp {
                 |ui| {
                     ui.set_clip_rect(visible);
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    if ui
-                        .add(
-                            egui::Button::new("×")
-                                .frame(false)
-                                .min_size(vec2(16.0, 22.0)),
-                        )
-                        .on_hover_text("Apagar a faixa de rótulos")
+                    if icons::button(ui, Icon::Close, 12.0, false, "Apagar a faixa de rótulos")
                         .clicked()
                     {
                         remove = true;
@@ -4093,10 +4659,7 @@ impl VoiceApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Roteiro").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("×")
-                    .on_hover_text("Esconder (Ver → Roteiro)")
-                    .clicked()
+                if icons::button(ui, Icon::Close, 12.0, false, "Esconder (Ver → Roteiro)").clicked()
                 {
                     self.show_script = false;
                 }
@@ -4178,6 +4741,10 @@ impl VoiceApp {
             Dialog::BassTreble { .. } => "Graves e agudos",
             Dialog::Limiter(_) => "Limitador",
             Dialog::DeEss { .. } => "De-esser",
+            Dialog::Fx(d) => d.title(),
+            Dialog::LabelSounds { .. } => "Rotular falas",
+            Dialog::MarkClipping { .. } => "Marcar áudio estourado",
+            Dialog::Duck { .. } => "Auto-duck (música abaixa na voz)",
             Dialog::ConfirmClose => "Sair sem salvar?",
             Dialog::ConfirmDiscard(_) => "Descartar as mudanças?",
             Dialog::Recover(_) => "Recuperação automática",
@@ -4188,6 +4755,17 @@ impl VoiceApp {
             matches!(dialog, Dialog::Recover(_)),
         );
         let ready = !matches!(dialog, Dialog::NoiseReduction { .. }) || noise_info.is_some();
+        let track_names: Vec<(u64, String)> = self
+            .ed
+            .session()
+            .tracks
+            .iter()
+            .map(|t| (t.id, t.name.clone()))
+            .collect();
+        let width = match dialog {
+            Dialog::Fx(d) => d.width(),
+            _ => 360.0,
+        };
         let body = |ui: &mut egui::Ui| {
             // Largura fixa para o valor de cada slider: ele não cresce nem encolhe com os dígitos.
             ui.spacing_mut().interact_size.x = theme::NUM_W + 12.0;
@@ -4292,6 +4870,106 @@ impl VoiceApp {
                             .suffix(" dB"),
                     );
                 }
+                Dialog::Fx(d) => d.ui(ui, RATE),
+                Dialog::LabelSounds {
+                    threshold,
+                    min_silence,
+                    min_sound,
+                    text,
+                } => {
+                    ui.label(
+                        RichText::new(
+                            "Cria um rótulo em cada trecho com som da faixa selecionada. \
+                             Dá para renomear e exportar como capítulos.",
+                        )
+                        .weak(),
+                    );
+                    ui.add(
+                        paw_ui::Slider::new(threshold, -70.0..=-20.0)
+                            .text("silêncio abaixo de")
+                            .suffix(" dB"),
+                    );
+                    ui.add(
+                        paw_ui::Slider::new(min_silence, 0.1..=3.0)
+                            .text("pausa de pelo menos")
+                            .suffix(" s"),
+                    );
+                    ui.add(
+                        paw_ui::Slider::new(min_sound, 0.05..=2.0)
+                            .text("som de pelo menos")
+                            .suffix(" s"),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Texto");
+                        ui.add(
+                            egui::TextEdit::singleline(text).desired_width(ui.available_width()),
+                        );
+                    });
+                }
+                Dialog::MarkClipping { level, min_run } => {
+                    ui.label(
+                        RichText::new(
+                            "Põe um rótulo onde o áudio passou do limite e ficou cortado.",
+                        )
+                        .weak(),
+                    );
+                    ui.add(
+                        paw_ui::Slider::new(level, 0.8..=1.0)
+                            .text("nível de corte")
+                            .max_decimals(3),
+                    );
+                    ui.add(paw_ui::Slider::new(min_run, 1..=20).text("amostras seguidas"));
+                }
+                Dialog::Duck {
+                    control,
+                    threshold,
+                    amount,
+                    attack,
+                    release,
+                } => {
+                    ui.label(
+                        RichText::new(
+                            "As faixas selecionadas (a música) abaixam quando a faixa de controle \
+                             (a voz) está falando.",
+                        )
+                        .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Voz (controle)");
+                        egui::ComboBox::from_id_salt("duck-control")
+                            .selected_text(
+                                track_names
+                                    .iter()
+                                    .find(|(id, _)| id == control)
+                                    .map_or("—", |(_, n)| n.as_str()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (id, name) in &track_names {
+                                    ui.selectable_value(control, *id, name);
+                                }
+                            });
+                    });
+                    ui.add(
+                        paw_ui::Slider::new(threshold, -60.0..=-10.0)
+                            .text("a voz passa de")
+                            .suffix(" dB"),
+                    );
+                    ui.add(
+                        paw_ui::Slider::new(amount, 3.0..=40.0)
+                            .text("música abaixa")
+                            .suffix(" dB"),
+                    );
+                    ui.add(
+                        paw_ui::Slider::new(attack, 5.0..=500.0)
+                            .text("desce em")
+                            .suffix(" ms"),
+                    );
+                    ui.add(
+                        paw_ui::Slider::new(release, 50.0..=3000.0)
+                            .text("volta em")
+                            .suffix(" ms"),
+                    );
+                }
                 Dialog::Limiter(db) => {
                     ui.label(RichText::new("Nada passa deste nível.").weak());
                     ui.add(
@@ -4349,7 +5027,7 @@ impl VoiceApp {
         if is_confirm || is_recover {
             paw_ui::dialog::modal(ctx, "voice", title, 380.0, body);
         } else {
-            paw_ui::dialog::window(ctx, "voice", title, 360.0, body);
+            paw_ui::dialog::window(ctx, "voice", title, width, body);
         }
         // Esc cancela e Enter aplica, como em qualquer diálogo. Esc não descarta a recuperação
         // (apagaria as gravações) e Enter não confirma "Sair sem salvar" nem a recuperação.
@@ -4412,6 +5090,35 @@ impl VoiceApp {
             }) => self.apply_effect("De-esser", move |p| {
                 effects::each(p, |s| dsp::de_ess(s, RATE, 5500.0, threshold, reduction))
             }),
+            Some(Dialog::LabelSounds {
+                threshold,
+                min_silence,
+                min_sound,
+                text,
+            }) => self.label_sounds(threshold, min_silence, min_sound, &text),
+            Some(Dialog::MarkClipping { level, min_run }) => {
+                self.mark_clipping(level, min_run as usize)
+            }
+            Some(Dialog::Duck {
+                control,
+                threshold,
+                amount,
+                attack,
+                release,
+            }) => self.auto_duck(control, threshold, amount, attack, release),
+            Some(Dialog::Fx(d)) => {
+                if let Some(samples) = d.generated(RATE) {
+                    self.stop();
+                    let at = self.cursor.min(self.ed.session().len());
+                    let id = self.ed.add_track(vec![samples], at, Some(d.title().into()));
+                    self.selected = vec![id];
+                } else {
+                    let label = d.job(RATE).0;
+                    // um job novo por trecho (e por "repetir último efeito")
+                    let resizes = d.resizes();
+                    self.apply_effect_ex(label, resizes, move |p| (d.job(RATE).1)(p));
+                }
+            }
             Some(Dialog::Limiter(db)) => self.apply_effect("Limitador", move |p| {
                 effects::each(p, |s| dsp::limit(s, RATE, db))
             }),
@@ -4442,6 +5149,7 @@ impl VoiceApp {
         let ctx = ui.ctx().clone();
         self.poll_file();
         self.poll_effect(&ctx);
+        self.poll_transcription(&ctx);
         if self.effect.is_none() {
             self.poll_imports();
         }
@@ -4590,6 +5298,291 @@ mod tests {
 
     fn mono(app: &VoiceApp, id: u64) -> Vec<f32> {
         app.ed.render(id).remove(0)
+    }
+
+    /// Os efeitos extras passam pelo diálogo e pelo editor: tempo encurta a faixa e o desfazer volta.
+    #[test]
+    fn extra_effects_apply_through_the_dialog_and_undo() {
+        let sine: Vec<f32> = (0..48_000)
+            .map(|i| 0.3 * (std::f32::consts::TAU * 300.0 * i as f32 / 48_000.0).sin())
+            .collect();
+        let (mut app, id) = app_with(sine.clone());
+        app.sel = Some((0, 48_000));
+        app.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::Tempo(2.0)));
+        let ctx = egui::Context::default();
+        // Enter aplica (não há campo de texto em foco)
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0))),
+            events: vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        ctx.run_ui(raw, |ui| {
+            let c = ui.ctx().clone();
+            app.dialogs(&c);
+        })
+        .drop_without_applying_deltas();
+        let len = mono(&app, id).len();
+        assert!(
+            (len as i64 - 24_000).abs() <= 2,
+            "tempo 2× deixa metade: {len}"
+        );
+        assert!(
+            app.sel.is_none(),
+            "a seleção antiga some quando a duração muda"
+        );
+        assert!(app.ed.undo());
+        assert_eq!(mono(&app, id).len(), 48_000);
+        // equalizador mantém o tamanho
+        app.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::equalizer()));
+        if let Some(Dialog::Fx(d)) = app.dialog.take() {
+            let label = d.job(RATE).0;
+            let resizes = d.resizes();
+            app.apply_effect_ex(label, resizes, move |p| (d.job(RATE).1)(p));
+        }
+        assert_eq!(mono(&app, id).len(), 48_000);
+    }
+
+    #[test]
+    fn repeat_last_effect_applies_the_same_effect_again() {
+        let (mut app, id) = app_with(vec![0.2; 4_800]);
+        // nada aplicado ainda: avisa e não mexe
+        app.repeat_last_effect();
+        assert!((mono(&app, id)[100] - 0.2).abs() < 1e-6);
+        app.apply_effect("Dobrar", |p| effects::each(p, |s| dsp::gain(s, 6.0)));
+        let once = mono(&app, id)[100];
+        assert!(once > 0.39, "{once}");
+        app.repeat_last_effect();
+        let twice = mono(&app, id)[100];
+        assert!((twice / once - 1.995).abs() < 0.02, "{once} -> {twice}");
+        // um diálogo de efeito (que muda a duração) também se repete
+        app.sel = None;
+        app.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::Repeat(2)));
+        if let Some(Dialog::Fx(d)) = app.dialog.take() {
+            let label = d.job(RATE).0;
+            let resizes = d.resizes();
+            app.apply_effect_ex(label, resizes, move |p| (d.job(RATE).1)(p));
+        }
+        assert_eq!(mono(&app, id).len(), 9_600);
+        app.sel = None;
+        app.repeat_last_effect();
+        assert_eq!(mono(&app, id).len(), 19_200);
+    }
+
+    #[test]
+    fn crossfade_swaps_two_tracks_over_the_selection() {
+        let (mut app, top) = app_with(vec![0.8; 4_800]);
+        let bottom = app.ed.add_track(vec![vec![0.8; 4_800]], 0, None);
+        // selecionadas fora de ordem de propósito
+        app.selected = vec![bottom, top];
+        app.sel = Some((0, 4_800));
+        app.crossfade_tracks(true);
+        let (t, b) = (mono(&app, top), mono(&app, bottom));
+        assert!(
+            t[10] > 0.7 && t[4_790] < 0.1,
+            "cima sai: {} {}",
+            t[10],
+            t[4_790]
+        );
+        assert!(b[10] < 0.1 && b[4_790] > 0.7, "baixo entra");
+        assert!((t[2_400] + b[2_400] - 0.8).abs() < 0.05, "soma constante");
+        // uma só faixa: avisa e não mexe
+        let before = mono(&app, top);
+        app.selected = vec![top];
+        app.crossfade_tracks(true);
+        assert_eq!(mono(&app, top), before);
+    }
+
+    #[test]
+    fn label_sounds_mark_clipping_and_duck_work_on_tracks() {
+        let rate = RATE as usize;
+        let mut voice = vec![0.0f32; rate * 4];
+        for (i, v) in voice[rate..rate * 2].iter_mut().enumerate() {
+            *v = 0.4 * (i as f32 * 0.05).sin();
+        }
+        for v in &mut voice[rate * 3..rate * 3 + 20] {
+            *v = 1.0; // estouro
+        }
+        let (mut app, voice_id) = app_with(voice);
+        app.selected = vec![voice_id];
+        app.label_sounds(-40.0, 0.5, 0.3, "Fala");
+        let labels = &app.ed.session().label_tracks[0].labels;
+        assert!(labels.iter().any(|l| l.text == "Fala 1"), "{labels:?}");
+        app.mark_clipping(0.99, 3);
+        let all: Vec<&str> = app
+            .ed
+            .session()
+            .label_tracks
+            .iter()
+            .flat_map(|t| t.labels.iter().map(|l| l.text.as_str()))
+            .collect();
+        assert!(all.iter().any(|t| t.starts_with("Estouro")), "{all:?}");
+        // música constante abaixa enquanto a voz fala
+        let music = app
+            .ed
+            .add_track(vec![vec![0.5; rate * 4]], 0, Some("Música".into()));
+        app.selected = vec![music];
+        app.sel = None;
+        app.auto_duck(voice_id, -35.0, 12.0, 20.0, 200.0);
+        let m = mono(&app, music);
+        assert!((m[rate / 4] - 0.5).abs() < 0.01, "sem voz fica igual");
+        assert!(
+            m[rate + rate / 2] < 0.2,
+            "com voz abaixa: {}",
+            m[rate + rate / 2]
+        );
+        // sem música selecionada avisa e não faz nada
+        app.selected = vec![voice_id];
+        let before = mono(&app, voice_id);
+        app.auto_duck(voice_id, -35.0, 12.0, 20.0, 200.0);
+        assert_eq!(mono(&app, voice_id), before);
+    }
+
+    /// Números absurdos nas ferramentas novas do PawVoice não derrubam nada.
+    #[test]
+    fn new_tools_survive_absurd_values() {
+        let weird = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -5.0, 0.0, 1e9];
+        let (mut app, voice) =
+            app_with((0..48_000).map(|i| (i as f32 * 0.05).sin() * 0.4).collect());
+        let music = app.ed.add_track(vec![vec![0.3; 48_000]], 0, None);
+        for &a in &weird {
+            for &b in &weird {
+                app.selected = vec![voice];
+                app.label_sounds(a, b, a, "x");
+                app.mark_clipping(a, 3);
+                app.selected = vec![music];
+                app.auto_duck(voice, a, b, a, b);
+                assert!(mono(&app, voice).iter().all(|v| v.is_finite()));
+                assert!(mono(&app, music).iter().all(|v| v.is_finite()));
+            }
+        }
+        // efeitos do diálogo com valores extremos (os sliders limitam, mas o motor não pode depender disso)
+        use crate::fx_dialogs::FxDialog;
+        for &a in &weird {
+            for d in [
+                FxDialog::Reverb {
+                    room: a,
+                    damping: a,
+                    wet: a,
+                },
+                FxDialog::Notch { hz: a, q: a },
+                FxDialog::Tremolo { hz: a, depth: a },
+                FxDialog::Speed(a),
+                FxDialog::Tempo(a),
+                FxDialog::Pitch(a),
+                FxDialog::Declip(a),
+                FxDialog::Repeat(40),
+            ] {
+                let (_, mut job) = d.job(RATE);
+                let mut p = vec![vec![0.2f32; 4800]];
+                job(&mut p);
+                assert!(p[0].len() <= 4800 * 40 * 2, "{d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn beat_ruler_labels_bars_and_beats() {
+        assert_eq!(beat_label(0, 4), "1");
+        assert_eq!(beat_label(1, 4), "1.2");
+        assert_eq!(beat_label(4, 4), "2");
+        assert_eq!(beat_label(11, 4), "3.4");
+        assert_eq!(beat_label(-1, 4), "0.4", "antes do zero não quebra");
+        assert_eq!(beat_label(5, 0), "6", "compasso de 0 tempos vira 1");
+        // a régua em compassos desenha sem travar, com qualquer andamento
+        let (mut app, _) = app_with(vec![0.1; 48_000]);
+        let ctx = egui::Context::default();
+        for beats in [
+            None,
+            Some((120.0, 4)),
+            Some((20.0, 1)),
+            Some((f32::NAN, 12)),
+            Some((1e9, 3)),
+        ] {
+            app.ruler_beats = beats;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0))),
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| app.frame(ui))
+                .drop_without_applying_deltas();
+        }
+    }
+
+    /// Medição (não é teste de verdade): `cargo test --release -p pawvoice-app frame_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn frame_cost_with_a_dialog_open() {
+        let n = 48_000 * 60 * 5;
+        let (mut app, _) = app_with((0..n).map(|i| (i as f32 * 0.01).sin() * 0.3).collect());
+        app.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::equalizer()));
+        let ctx = egui::Context::default();
+        let mut times = Vec::new();
+        for i in 0..80 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1480.0, 880.0))),
+                events: vec![egui::Event::PointerMoved(pos2(300.0 + i as f32, 200.0))],
+                ..Default::default()
+            };
+            let t = std::time::Instant::now();
+            ctx.run_ui(raw, |ui| {
+                app.frame(ui);
+                let c = ui.ctx().clone();
+                app.dialogs(&c);
+            })
+            .drop_without_applying_deltas();
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(|a, b| a.total_cmp(b));
+        eprintln!(
+            "frame ms: min {:.2} mediana {:.2} p90 {:.2} max {:.2}",
+            times[0],
+            times[times.len() / 2],
+            times[times.len() * 9 / 10],
+            times[times.len() - 1]
+        );
+    }
+
+    #[test]
+    fn transcription_turns_speech_into_labels() {
+        let (mut app, _) = app_with(vec![0.1; 48_000 * 4]);
+        let srt = "1\n00:00:00,500 --> 00:00:01,500\nOlá\n\n2\n00:00:02,000 --> 00:00:03,250\nTudo bem?\n\n";
+        app.finish_transcription(srt);
+        let labels = &app.ed.session().label_tracks[0].labels;
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].at, 24_000);
+        assert_eq!(labels[1].end, 156_000);
+        assert_eq!(labels[1].text, "Tudo bem?");
+        assert!(app.ed.undo(), "um passo de desfazer");
+        assert!(app.ed.session().label_tracks.is_empty());
+        // SRT vazio avisa e não cria faixa
+        app.finish_transcription("");
+        assert!(app.ed.session().label_tracks.is_empty());
+        // sem whisper instalado: avisa e não fica "transcrevendo"
+        app.start_transcription("pt");
+        assert!(app.transcription.is_none());
+    }
+
+    #[test]
+    fn loop_region_overrides_the_selection_while_looping() {
+        let (mut app, _) = app_with(vec![0.1; 48_000]);
+        app.sel = Some((100, 200));
+        app.loop_region = Some((1000, 5000));
+        app.looping = false;
+        app.toggle_play();
+        assert!(app.play_active);
+        app.stop();
+        // não vazamos a região para além do fim do áudio
+        app.looping = true;
+        app.loop_region = Some((40_000, 90_000));
+        app.toggle_play();
+        assert!(app.play_active);
+        app.stop();
     }
 
     /// Desenha os menus da faixa (mono e estéreo) e o da área vazia sem travar.

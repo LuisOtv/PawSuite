@@ -64,6 +64,8 @@ pub enum ClipChange {
     DissolveColor(Option<Rgba>),
     BlurFill(bool),
     Chroma(Option<ChromaKey>),
+    /// Troca a lista de efeitos de áudio do clipe.
+    AudioFx(Vec<crate::model::AudioFx>),
 }
 /// Uma alteração no projeto. Aplicada pelo `Editor`, que guarda o histórico.
 #[derive(Debug, Clone, PartialEq)]
@@ -141,6 +143,8 @@ pub enum Edit {
         frame: Frame,
         marker: Option<Marker>,
     },
+    /// Troca as anotações do projeto.
+    SetNotes(String),
     /// Muda a resolução do projeto (o FPS fica fixo).
     SetResolution {
         width: u32,
@@ -256,7 +260,64 @@ pub enum EditError {
     NoChange,
 }
 
+/// Maior posição (ou duração) aceita na linha do tempo: mais de 100 anos a 30 fps. Valores
+/// maiores só vêm de arquivo estragado ou de erro de conta, e estourariam as somas.
+pub const MAX_FRAME: Frame = 100_000_000_000;
+
+fn in_range(frames: &[Frame]) -> bool {
+    frames.iter().all(|f| (-MAX_FRAME..=MAX_FRAME).contains(f))
+}
+
+fn draft_ok(d: &ClipDraft) -> bool {
+    in_range(&[d.duration]) && d.source_start.abs() <= MAX_FRAME as f64
+}
+
+/// Recusa edições com posições ou durações fora do intervalo aceito.
+fn check_ranges(edit: &Edit) -> Result<(), EditError> {
+    let ok = match edit {
+        Edit::Overwrite { at, items } | Edit::Insert { at, items } => {
+            in_range(&[*at]) && items.iter().all(|i| draft_ok(&i.draft))
+        }
+        Edit::Append { items } => items.iter().all(|i| draft_ok(&i.draft)),
+        Edit::Blade { at, .. } | Edit::CloseGap { at, .. } => in_range(&[*at]),
+        Edit::Move { delta, .. }
+        | Edit::Trim { delta, .. }
+        | Edit::RippleTrim { delta, .. }
+        | Edit::Roll { delta, .. }
+        | Edit::Slip { delta, .. } => in_range(&[*delta]),
+        Edit::SetDissolve { frames, .. } => in_range(&[*frames]),
+        Edit::RippleTrimToPlayhead { at, .. } => in_range(&[*at]),
+        Edit::RippleDeleteRange { start, end, .. } | Edit::DeleteRange { start, end, .. } => {
+            in_range(&[*start, *end])
+        }
+        Edit::SetMarker { frame, .. } => in_range(&[*frame]),
+        Edit::SetKeyframe { at, .. } | Edit::SetKeyframeEase { at, .. } => {
+            at.is_finite() && at.abs() <= MAX_FRAME as f64
+        }
+        Edit::Paste { at, clips } => {
+            in_range(&[*at])
+                && clips.iter().all(|(_, c)| {
+                    in_range(&[c.start, c.duration, c.fade_in, c.fade_out, c.dissolve_in])
+                        && c.source_start.abs() <= MAX_FRAME as f64
+                })
+        }
+        Edit::SetClip { change, .. } => match change {
+            ClipChange::FadeIn(f) | ClipChange::FadeOut(f) => in_range(&[*f]),
+            ClipChange::Freeze(Some(t)) => t.is_finite() && t.abs() <= MAX_FRAME as f64,
+            ClipChange::VolumeDb(v) => v.is_finite() && v.abs() <= 200.0,
+            _ => true,
+        },
+        _ => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(EditError::InvalidValue("posição ou duração fora do limite"))
+    }
+}
+
 pub(crate) fn apply(p: &mut Project, edit: Edit) -> Result<Outcome, EditError> {
+    check_ranges(&edit)?;
     match edit {
         Edit::AddMedia(info) => {
             let id = MediaId(p.ids.fresh());
@@ -347,6 +408,13 @@ pub(crate) fn apply(p: &mut Project, edit: Edit) -> Result<Outcome, EditError> {
                 p.markers.push(m);
                 p.markers.sort_by_key(|m| m.frame);
             }
+            Ok(Outcome::default())
+        }
+        Edit::SetNotes(text) => {
+            if p.notes == text {
+                return Err(EditError::NoChange);
+            }
+            p.notes = text;
             Ok(Outcome::default())
         }
         Edit::SetResolution { width, height } => {
@@ -585,6 +653,7 @@ fn place(p: &mut Project, at: Frame, items: Vec<Placement>) -> Result<Outcome, E
             dissolve_color: None,
             blur_fill: false,
             chroma: None,
+            audio_fx: Vec::new(),
         };
         let (track, ids) = p
             .track_and_ids(pl.track)
@@ -882,6 +951,15 @@ fn set_clip(p: &mut Project, id: ClipId, change: ClipChange) -> Result<Outcome, 
         ClipChange::FadeCurve(e) => c.fade_curve = e,
         ClipChange::DissolveColor(color) => c.dissolve_color = color,
         ClipChange::BlurFill(on) => c.blur_fill = on,
+        ClipChange::AudioFx(list) => {
+            if list.len() > 12 || list.iter().any(|f| !f.is_valid()) {
+                return Err(EditError::InvalidValue("efeito de áudio fora da faixa"));
+            }
+            if c.audio_fx == list {
+                return Err(EditError::NoChange);
+            }
+            c.audio_fx = list;
+        }
         ClipChange::Chroma(k) => {
             if let Some(k) = &k {
                 let ok = |v: f32| (0.0..=1.0).contains(&v);
@@ -1248,6 +1326,14 @@ fn paste(p: &mut Project, at: Frame, clips: Vec<(TrackId, Clip)>) -> Result<Outc
         if c.duration < 1 || at + c.start < 0 {
             return Err(EditError::InvalidValue("clipe colado inválido"));
         }
+        if !(c.speed.is_finite() && (0.1..=10.0).contains(&c.speed))
+            || !c.source_start.is_finite()
+            || c.source_start < 0.0
+        {
+            return Err(EditError::InvalidValue(
+                "velocidade ou ponto de início inválido",
+            ));
+        }
         let _ = track;
     }
     let mut links = HashMap::new();
@@ -1339,11 +1425,13 @@ impl Edit {
                 ClipChange::DissolveColor(_) => "Transição",
                 ClipChange::BlurFill(_) => "Fundo desfocado",
                 ClipChange::Chroma(_) => "Chroma key",
+                ClipChange::AudioFx(_) => "Efeitos de áudio",
             },
             Edit::SetSpeed { .. } => "Velocidade",
             Edit::Link { .. } => "Ligar clipes",
             Edit::Unlink { .. } => "Separar áudio e vídeo",
             Edit::SetMarker { .. } => "Marcador",
+            Edit::SetNotes(_) => "Notas do projeto",
             Edit::SetResolution { .. } => "Resolução do projeto",
             Edit::SetDissolve { .. } => "Dissolve",
             Edit::RippleTrimToPlayhead { .. } => "Cortar até o cursor",

@@ -516,7 +516,7 @@ impl Editor {
         let seg = self.add_source(&planar);
         let t = self.track_mut(left)?;
         t.channels = 2;
-        t.segments = vec![seg];
+        t.segments = merge(vec![seg]);
         t.envelope.clear();
         t.pan = 0.0;
         self.session.tracks.retain(|x| x.id != right);
@@ -589,6 +589,43 @@ impl Editor {
             },
         );
         Ok((tid, at_i))
+    }
+
+    /// Vários rótulos de uma vez, num único passo de desfazer (ex.: um por trecho de fala).
+    /// Cria uma faixa de rótulos nova quando `new_track` é verdade ou não há nenhuma.
+    pub fn add_labels(
+        &mut self,
+        new_track: bool,
+        items: &[(usize, usize, String)],
+        undo_label: &'static str,
+    ) -> Result<u64, EditError> {
+        if items.is_empty() {
+            return Err(EditError::EmptyRange);
+        }
+        self.checkpoint(undo_label);
+        let tid = if new_track || self.session.label_tracks.is_empty() {
+            self.new_label_track()
+        } else {
+            self.session.label_tracks[0].id
+        };
+        let t = self
+            .session
+            .label_tracks
+            .iter_mut()
+            .find(|t| t.id == tid)
+            .ok_or(EditError::NoTrack)?;
+        for (at, end, text) in items {
+            let i = t.labels.partition_point(|l| l.at <= *at);
+            t.labels.insert(
+                i,
+                Label {
+                    at: *at,
+                    end: (*end).max(*at),
+                    text: text.clone(),
+                },
+            );
+        }
+        Ok(tid)
     }
 
     pub fn set_label_text(
@@ -942,10 +979,16 @@ impl Editor {
         if pieces.is_empty() {
             return Err(EditError::EmptyRange);
         }
+        let lens = pieces
+            .iter()
+            .map(|(_, p)| p.iter().map(Vec::len).max().unwrap_or(0))
+            .collect();
         Ok(ProcessJob {
             a,
             revision: self.revision,
             pieces,
+            lens,
+            resized: false,
         })
     }
 
@@ -961,14 +1004,23 @@ impl Editor {
         }
         self.checkpoint(label);
         let a = job.a;
-        for (id, mut planar) in job.pieces {
+        for ((id, mut planar), old_len) in job.pieces.into_iter().zip(job.lens) {
             let len = planar.iter().map(Vec::len).max().unwrap_or(0);
             for ch in &mut planar {
                 ch.resize(len, 0.0);
             }
             let seg = self.add_source(&planar);
             let t = self.track_mut(id)?;
-            t.segments = overwrite(&t.segments, a, &[seg]);
+            if job.resized && len != old_len {
+                // Troca o trecho antigo pelo novo e empurra o resto (e o envelope junto).
+                let old_b = a + old_len;
+                t.segments = ripple_delete(&t.segments, a, old_b);
+                t.segments = insert(&t.segments, a, &[seg]);
+                env_delete(&mut t.envelope, a, old_b);
+                env_insert(&mut t.envelope, a, len);
+            } else {
+                t.segments = overwrite(&t.segments, a, &[seg]);
+            }
         }
         self.prune();
         Ok(())
@@ -1011,6 +1063,10 @@ pub struct ProcessJob {
     a: usize,
     revision: u64,
     pieces: Vec<(u64, Planar)>,
+    /// Tamanho original de cada trecho (para o efeito que muda a duração).
+    lens: Vec<usize>,
+    /// O efeito mudou a duração: o resultado entra no lugar do trecho e empurra o resto.
+    resized: bool,
 }
 
 impl ProcessJob {
@@ -1024,6 +1080,25 @@ impl ProcessJob {
                 ch.resize(len, 0.0);
             }
         }
+    }
+
+    /// Como `run`, mas o resultado pode ter outro tamanho (velocidade, tempo): ele entra no
+    /// lugar do trecho e o resto da faixa anda para frente ou para trás. Os canais de um
+    /// trecho ficam do mesmo tamanho (o menor é completado com silêncio).
+    pub fn run_resize(&mut self, mut f: impl FnMut(&mut [Vec<f32>])) {
+        for (_, planar) in &mut self.pieces {
+            f(planar);
+            let len = planar.iter().map(Vec::len).max().unwrap_or(0);
+            for ch in planar.iter_mut() {
+                ch.resize(len, 0.0);
+            }
+        }
+        self.resized = true;
+    }
+
+    /// O efeito mudou a duração dos trechos (`run_resize`).
+    pub fn is_resized(&self) -> bool {
+        self.resized
     }
 
     /// Total de amostras (todos os canais de todos os trechos): mede o tamanho do trabalho.
@@ -1152,6 +1227,215 @@ mod tests {
 
     fn mono(e: &Editor, id: u64) -> Vec<f32> {
         e.render(id).into_iter().next().unwrap_or_default()
+    }
+
+    /// Operações aleatórias: o editor nunca derruba e as faixas ficam coerentes (o tamanho é a
+    /// soma dos trechos, nenhum trecho passa do fim da fonte, a mixagem se calcula).
+    #[test]
+    fn monkey_test_keeps_the_session_consistent() {
+        fn check(e: &Editor, step: usize, seed: u64) {
+            for t in &e.session().tracks {
+                let sum: usize = t.segments.iter().map(|s| s.len()).sum();
+                assert_eq!(t.len(), sum, "seed {seed} passo {step}: tamanho da faixa");
+                for s in &t.segments {
+                    assert!(
+                        s.start < s.end,
+                        "seed {seed} passo {step}: trecho vazio {s:?} na faixa {} ({:?}) rótulo do desfazer {:?}",
+                        t.id,
+                        t.segments,
+                        e.undo_label()
+                    );
+                    if s.source != crate::SILENCE {
+                        let src = e.sources().get(&s.source).unwrap_or_else(|| {
+                            panic!("seed {seed} passo {step}: fonte {} sumiu", s.source)
+                        });
+                        assert!(
+                            s.end <= src.frames(),
+                            "seed {seed} passo {step}: trecho passa da fonte"
+                        );
+                    }
+                }
+                let r = e.render(t.id);
+                assert_eq!(r.len(), t.channels as usize);
+                assert!(r.iter().all(|c| c.len() == t.len()));
+            }
+            let len = e.session().len();
+            assert!(e.mix(0, len.min(5000)).iter().all(|v| v.is_finite()));
+        }
+        for seed in 1..=4u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rnd = move |n: usize| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % n.max(1) as u64) as usize
+            };
+            let mut e = Editor::new(Session::new(48_000), BTreeMap::new());
+            e.add_track(ramp(2000), 0, None);
+            for step in 0..150 {
+                let ids: Vec<u64> = e.session().tracks.iter().map(|t| t.id).collect();
+                let len = e.session().len().max(1);
+                let (a, b) = {
+                    let (x, y) = (rnd(len + 200), rnd(len + 200));
+                    (x.min(y), x.max(y))
+                };
+                let sel: Vec<u64> = ids.iter().copied().filter(|_| rnd(2) == 0).collect();
+                let one = ids.get(rnd(ids.len().max(1))).copied().unwrap_or(0);
+                match rnd(22) {
+                    0 => {
+                        e.add_track(ramp(100 + rnd(2000)), rnd(500), None);
+                    }
+                    1 => {
+                        let _ = e.delete(&sel, a, b);
+                    }
+                    2 => {
+                        let _ = e.silence(&sel, a, b);
+                    }
+                    3 => {
+                        let _ = e.trim(&sel, a, b);
+                    }
+                    4 => {
+                        let _ = e.copy(&sel, a, b);
+                    }
+                    5 => {
+                        let _ = e.cut(&sel, a, b);
+                    }
+                    6 => {
+                        let _ = e.paste(ids.first().copied(), rnd(len));
+                    }
+                    7 => {
+                        let _ = e.duplicate(&sel, a, b);
+                    }
+                    8 => {
+                        let _ = e.split_new(&sel, a, b);
+                    }
+                    9 => {
+                        let to = ids.get(rnd(ids.len().max(1))).copied().unwrap_or(0);
+                        let _ = e.move_clip(one, a, b, to, rnd(len + 100));
+                    }
+                    10 => {
+                        let _ = e.remove_track(one);
+                    }
+                    11 => {
+                        let _ = e.split_stereo(one, rnd(2) == 0);
+                    }
+                    12 => {
+                        if ids.len() >= 2 {
+                            let _ = e.join_stereo(ids[0], ids[1]);
+                        }
+                    }
+                    13 => {
+                        let _ = e.swap_channels(one);
+                    }
+                    14 => {
+                        let _ = e.process(&sel, a, b, "x", |p| {
+                            for ch in p {
+                                for v in ch.iter_mut() {
+                                    *v *= 0.5;
+                                }
+                            }
+                        });
+                    }
+                    15 | 16 => {
+                        // efeito que muda a duração (encolhe ou estica) em faixas selecionadas
+                        if let Ok(mut job) = e.begin_process(&sel, a, b) {
+                            let grow = rnd(2) == 0;
+                            job.run_resize(|p| {
+                                for ch in p.iter_mut() {
+                                    if grow {
+                                        let c = ch.clone();
+                                        ch.extend_from_slice(&c);
+                                    } else {
+                                        ch.truncate(ch.len() / 2);
+                                    }
+                                }
+                            });
+                            let _ = e.finish_process(job, "tempo");
+                        }
+                    }
+                    17 => {
+                        e.undo();
+                    }
+                    18 => {
+                        e.redo();
+                    }
+                    19 => {
+                        let _ = e.add_labels(rnd(2) == 0, &[(a, b, "x".into())], "r");
+                    }
+                    20 => {
+                        e.set_envelope(
+                            one,
+                            vec![
+                                EnvPoint { at: a, value: 0.5 },
+                                EnvPoint { at: b, value: 1.5 },
+                            ],
+                        );
+                    }
+                    _ => {
+                        let _ = e.write_at(one, a, ramp(50 + rnd(300)));
+                    }
+                }
+                check(&e, step, seed);
+            }
+        }
+    }
+
+    #[test]
+    fn add_labels_is_one_undo_step_and_keeps_labels_sorted() {
+        let mut e = Editor::new(Session::new(48_000), BTreeMap::new());
+        e.add_track(ramp(100), 0, None);
+        let tid = e
+            .add_labels(
+                true,
+                &[
+                    (50, 60, "b".into()),
+                    (10, 20, "a".into()),
+                    (80, 80, "c".into()),
+                ],
+                "Rotular",
+            )
+            .unwrap();
+        let t = e.session().label_track(tid).unwrap();
+        let order: Vec<&str> = t.labels.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(order, ["a", "b", "c"]);
+        assert!(e.add_labels(false, &[], "x").is_err());
+        assert!(e.undo());
+        assert!(e.session().label_tracks.is_empty());
+    }
+
+    #[test]
+    fn resizing_effect_replaces_the_range_and_shifts_the_rest() {
+        let mut e = Editor::new(Session::new(48_000), BTreeMap::new());
+        let id = e.add_track(ramp(100), 0, None);
+        // trecho [20, 60) vira 10 amostras iguais a -1: a faixa encolhe 30
+        let mut job = e.begin_process(&[id], 20, 60).unwrap();
+        job.run_resize(|p| {
+            for ch in p {
+                *ch = vec![-1.0; 10];
+            }
+        });
+        e.finish_process(job, "Tempo").unwrap();
+        let out = mono(&e, id);
+        assert_eq!(out.len(), 70);
+        assert_eq!(out[19], 20.0);
+        assert!(out[20..30].iter().all(|v| *v == -1.0));
+        assert_eq!(out[30], 61.0);
+        assert_eq!(out[69], 100.0);
+        // e dá para desfazer
+        assert!(e.undo());
+        assert_eq!(
+            mono(&e, id),
+            (1..=100).map(|i| i as f32).collect::<Vec<_>>()
+        );
+        // crescer também
+        let mut job = e.begin_process(&[id], 90, 100).unwrap();
+        job.run_resize(|p| {
+            for ch in p {
+                *ch = vec![5.0; 30];
+            }
+        });
+        e.finish_process(job, "Tempo").unwrap();
+        assert_eq!(mono(&e, id).len(), 120);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::par;
 use crate::selection::Selection;
 use crate::tile::{TILE, TiledImage, premultiply, unpremultiply};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Filter {
     /// Ambos de −1 a 1.
     BrightnessContrast {
@@ -100,6 +100,21 @@ pub fn curve_lut(points: &[(f32, f32)]) -> [f32; 256] {
 
 impl Filter {
     /// Quanto o filtro espalha pixels para fora do conteúdo (para ampliar a área processada).
+    /// O resultado de cada pixel só depende dele mesmo (serve para camada de ajuste).
+    pub fn is_pointwise(&self) -> bool {
+        matches!(
+            self,
+            Filter::BrightnessContrast { .. }
+                | Filter::HueSaturation { .. }
+                | Filter::Invert
+                | Filter::Desaturate
+                | Filter::Threshold(_)
+                | Filter::Posterize(_)
+                | Filter::Levels { .. }
+                | Filter::Curves(_)
+        )
+    }
+
     fn reach(&self) -> usize {
         match self {
             Filter::GaussianBlur(r) => (r * 3.0).ceil() as usize + 1,
@@ -445,6 +460,126 @@ fn to_f32(p: [u8; 4]) -> [f32; 4] {
         p[2] as f32 / 255.0,
         p[3] as f32 / 255.0,
     ]
+}
+
+/// Para os filtros que mexem em cada canal do mesmo jeito (brilho, níveis, curvas, inverter,
+/// posterizar): a tabela de 256 valores. Sai de rodar o próprio filtro numa rampa de cinza.
+fn channel_lut(filter: &Filter) -> Option<[u8; 256]> {
+    if !matches!(
+        filter,
+        Filter::BrightnessContrast { .. }
+            | Filter::Levels { .. }
+            | Filter::Invert
+            | Filter::Posterize(_)
+            | Filter::Curves(_)
+    ) {
+        return None;
+    }
+    let mut ramp: Buf = (0..256)
+        .map(|v| {
+            let g = v as f32 / 255.0;
+            [g, g, g, 1.0]
+        })
+        .collect();
+    run(filter, &mut ramp, 256, 1);
+    let mut lut = [0u8; 256];
+    for (o, p) in lut.iter_mut().zip(&ramp) {
+        *o = (p[0] * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    Some(lut)
+}
+
+/// Aplica um filtro pontual num bloco inteiro (RGBA pré-multiplicado, `TILE`×`TILE`): é o que a
+/// camada de ajuste faz com o que está embaixo dela. Filtros que olham os vizinhos não mudam nada.
+pub fn apply_to_tile(filter: &Filter, tile: &mut [u8]) {
+    if !filter.is_pointwise() || tile.len() != crate::tile::TILE_BYTES {
+        return;
+    }
+    if let Some(lut) = channel_lut(filter) {
+        for p in tile.as_chunks_mut::<4>().0.iter_mut() {
+            match p[3] {
+                0 => {}
+                255 => {
+                    // opaco: pré-multiplicado e direto são a mesma coisa
+                    p[0] = lut[p[0] as usize];
+                    p[1] = lut[p[1] as usize];
+                    p[2] = lut[p[2] as usize];
+                }
+                _ => {
+                    let s = unpremultiply(*p);
+                    *p = premultiply([
+                        lut[s[0] as usize],
+                        lut[s[1] as usize],
+                        lut[s[2] as usize],
+                        s[3],
+                    ]);
+                }
+            }
+        }
+        return;
+    }
+    // Dessaturar e limiar por luminosidade: nos pixels opacos dá para fazer direto em inteiros;
+    // se não sobrou nenhum pixel translúcido, nem precisa do caminho geral.
+    if let Filter::Desaturate | Filter::Threshold(_) = filter {
+        let cut = if let Filter::Threshold(t) = filter {
+            Some(t.clamp(0.0, 1.0) as f64 * 255.0 * 65536.0)
+        } else {
+            None
+        };
+        let mut translucent = false;
+        for p in tile.as_chunks_mut::<4>().0.iter_mut() {
+            match p[3] {
+                0 => {}
+                255 => {
+                    // pesos 0,299 / 0,587 / 0,114 com 16 bits de fração
+                    let sum = 19595 * p[0] as u32 + 38470 * p[1] as u32 + 7471 * p[2] as u32;
+                    let v = match cut {
+                        Some(c) => {
+                            if sum as f64 >= c {
+                                255
+                            } else {
+                                0
+                            }
+                        }
+                        None => ((sum + 32768) >> 16).min(255) as u8,
+                    };
+                    p[0] = v;
+                    p[1] = v;
+                    p[2] = v;
+                }
+                _ => translucent = true,
+            }
+        }
+        if !translucent {
+            return;
+        }
+    }
+    let mut buf: Buf = tile
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| {
+            if p[3] == 0 {
+                [0.0; 4]
+            } else {
+                to_f32(unpremultiply(*p))
+            }
+        })
+        .collect();
+    let side = crate::tile::TILE;
+    run(filter, &mut buf, side, side);
+    for (p, n) in tile.as_chunks_mut::<4>().0.iter_mut().zip(&buf) {
+        if p[3] == 0 {
+            continue;
+        }
+        let q = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+        // o alfa não muda: ajuste de cor só tinge o que já existe
+        *p = if p[3] == 255 {
+            [q(n[0]), q(n[1]), q(n[2]), 255]
+        } else {
+            premultiply([q(n[0]), q(n[1]), q(n[2]), q(n[3])])
+        };
+    }
 }
 
 /// Aplica `filter` em `pixels`. Só muda o que a seleção deixa; com `alpha_lock` o alfa não muda.
@@ -851,5 +986,113 @@ mod tests {
             (0..5).all(|k| t.tile(k, k).unwrap().as_ptr() == again.tile(k, k).unwrap().as_ptr()),
             "filtro neutro não deve copiar blocos"
         );
+    }
+
+    /// A camada de ajuste (rápida, por bloco) dá o mesmo resultado do filtro aplicado de verdade
+    /// nos pixels, com margem de 1 nível por arredondamento.
+    #[test]
+    fn tile_adjustment_matches_the_real_filter() {
+        let filters = [
+            Filter::Invert,
+            Filter::Desaturate,
+            Filter::Threshold(0.45),
+            Filter::Posterize(5),
+            Filter::BrightnessContrast {
+                brightness: 0.2,
+                contrast: -0.3,
+            },
+            Filter::HueSaturation {
+                hue: 40.0,
+                saturation: 0.3,
+                lightness: -0.1,
+            },
+            Filter::Levels {
+                black: 0.1,
+                white: 0.9,
+                gamma: 1.4,
+            },
+            Filter::Curves(vec![(0.0, 0.1), (0.4, 0.3), (1.0, 0.9)]),
+        ];
+        // pixels opacos, translúcidos e transparentes misturados
+        let mut img = TiledImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let a = match (x + y) % 4 {
+                    0 => 0,
+                    1 => 128,
+                    _ => 255,
+                };
+                let c = [(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8];
+                img.set_pixel(x, y, premultiply([c[0], c[1], c[2], a]));
+            }
+        }
+        for f in filters {
+            let mut tile = vec![0u8; crate::tile::TILE_BYTES];
+            for y in 0..64 {
+                for x in 0..64 {
+                    let p = img.pixel(x, y);
+                    tile[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].copy_from_slice(&p);
+                }
+            }
+            apply_to_tile(&f, &mut tile);
+            let mut real = img.clone();
+            apply(&mut real, &f, None, true); // trava de alfa: o alfa não muda, como no ajuste
+            for y in 0..64 {
+                for x in 0..64 {
+                    let (got, want) = (
+                        [
+                            tile[(y * 64 + x) * 4],
+                            tile[(y * 64 + x) * 4 + 1],
+                            tile[(y * 64 + x) * 4 + 2],
+                            tile[(y * 64 + x) * 4 + 3],
+                        ],
+                        real.pixel(x, y),
+                    );
+                    assert_eq!(got[3], want[3], "{f:?} alfa em {x},{y}");
+                    for c in 0..3 {
+                        assert!(
+                            (got[c] as i32 - want[c] as i32).abs() <= 3,
+                            "{f:?} em {x},{y} canal {c}: {got:?} vs {want:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Quanto custa um filtro de ajuste por bloco (4096 blocos = uma imagem de 4096²).
+    #[test]
+    #[ignore]
+    fn adjustment_tile_cost() {
+        let mut tile = vec![0u8; crate::tile::TILE_BYTES];
+        for (i, p) in tile.chunks_mut(4).enumerate() {
+            p.copy_from_slice(&[(i % 251) as u8, (i % 199) as u8, (i % 97) as u8, 255]);
+        }
+        for f in [
+            Filter::Invert,
+            Filter::Curves(vec![(0.0, 0.0), (0.5, 0.6), (1.0, 1.0)]),
+            Filter::BrightnessContrast {
+                brightness: 0.1,
+                contrast: 0.2,
+            },
+            Filter::HueSaturation {
+                hue: 20.0,
+                saturation: 0.2,
+                lightness: 0.0,
+            },
+            Filter::Desaturate,
+            Filter::Threshold(0.4),
+        ] {
+            let t = std::time::Instant::now();
+            for _ in 0..4096 {
+                let mut x = tile.clone();
+                apply_to_tile(&f, &mut x);
+            }
+            println!(
+                "{:?}: {:?} por imagem de 4096²",
+                std::mem::discriminant(&f),
+                t.elapsed()
+            );
+        }
     }
 }

@@ -13,7 +13,7 @@ pub fn resolve_layout(visible: &BTreeSet<Panel>) -> DockState<Panel> {
     let has = |p: Panel| visible.contains(&p);
     // Colunas de cima, da esquerda para a direita, com a largura relativa de cada uma.
     let mut columns: Vec<(Vec<Panel>, f32)> = Vec::new();
-    let left: Vec<Panel> = [Panel::MediaPool, Panel::Effects]
+    let left: Vec<Panel> = [Panel::MediaPool, Panel::Effects, Panel::Notes]
         .into_iter()
         .filter(|p| has(*p))
         .collect();
@@ -60,11 +60,11 @@ pub fn resolve_layout(visible: &BTreeSet<Panel>) -> DockState<Panel> {
         remaining -= w;
         current = right_node;
     }
-    // Effects embaixo do Media Pool, na mesma coluna.
+    // Effects (e Notas) embaixo do Media Pool, na mesma coluna.
     if let Some((first_col, _)) = columns.first()
-        && first_col.len() == 2
+        && first_col.len() >= 2
     {
-        tree.split_below(nodes[0], 0.62, vec![first_col[1]]);
+        tree.split_below(nodes[0], 0.62, first_col[1..].to_vec());
     }
     dock
 }
@@ -92,7 +92,7 @@ impl PanelLayout {
         resolve_layout(
             &Panel::ALL
                 .into_iter()
-                .filter(|p| *p != Panel::SourceViewer)
+                .filter(|p| !matches!(p, Panel::SourceViewer | Panel::Notes))
                 .collect(),
         )
     }
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn every_subset_builds_with_each_panel_once() {
-        for mask in 1u32..64 {
+        for mask in 1u32..(1 << Panel::ALL.len()) {
             let set: BTreeSet<Panel> = Panel::ALL
                 .into_iter()
                 .enumerate()

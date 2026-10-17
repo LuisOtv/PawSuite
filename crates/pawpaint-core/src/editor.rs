@@ -29,6 +29,10 @@ pub enum EditError {
     Locked,
     #[error("isto é uma pasta: escolha uma camada de dentro")]
     IsGroup,
+    #[error("é uma camada de ajuste (não tem pixels): pinte na máscara dela")]
+    IsAdjustment,
+    #[error("esse filtro olha os vizinhos e não serve para camada de ajuste")]
+    NotAdjustable,
     #[error("não há nada selecionado")]
     NoSelection,
     #[error("não há camada para unir")]
@@ -104,6 +108,8 @@ pub struct Editor {
     stroke: Option<ActiveStroke>,
     smudge: Option<ActiveSmudge>,
     mirror: (bool, bool),
+    wrap: bool,
+    radial: u32,
     paint_mask: bool,
     pixel_rev: u64,
     history_budget: usize,
@@ -155,6 +161,8 @@ impl Editor {
             stroke: None,
             smudge: None,
             mirror: (false, false),
+            wrap: false,
+            radial: 1,
             paint_mask: false,
             pixel_rev: 0,
             history_budget: HISTORY_BUDGET,
@@ -172,6 +180,12 @@ impl Editor {
         Self::from_doc(doc)
     }
 
+    /// Só para testes: acesso direto ao documento (sem passo de desfazer).
+    #[cfg(test)]
+    pub fn doc_mut_for_test(&mut self) -> &mut Doc {
+        &mut self.doc
+    }
+
     pub fn doc(&self) -> &Doc {
         &self.doc
     }
@@ -183,6 +197,24 @@ impl Editor {
     /// Sobe quando os pixels mudam (inclusive ao fim de um traço), para miniaturas.
     pub fn pixel_rev(&self) -> u64 {
         self.revision + self.pixel_rev
+    }
+
+    /// Modo de repetição (mosaico): o traço que passa de uma borda reaparece na oposta.
+    pub fn set_wrap(&mut self, on: bool) {
+        self.wrap = on;
+    }
+
+    /// Simetria radial: quantas vezes o traço se repete em volta do centro (1 = desligada).
+    pub fn set_radial(&mut self, n: u32) {
+        self.radial = n.clamp(1, 32);
+    }
+
+    pub fn radial(&self) -> u32 {
+        self.radial
+    }
+
+    pub fn wrap(&self) -> bool {
+        self.wrap
     }
 
     pub fn set_mirror(&mut self, horizontal_axis: bool, vertical_axis: bool) {
@@ -352,6 +384,15 @@ impl Editor {
     }
 
     fn layer_checked(&self, id: LayerId) -> Result<&Layer, EditError> {
+        let l = self.layer_for_paint(id)?;
+        if l.adjust.is_some() {
+            return Err(EditError::IsAdjustment);
+        }
+        Ok(l)
+    }
+
+    /// Como `layer_checked`, mas deixa passar a camada de ajuste (que só aceita pintura na máscara).
+    fn layer_for_paint(&self, id: LayerId) -> Result<&Layer, EditError> {
         let l = self.doc.layer(id).ok_or(EditError::NoLayer)?;
         if l.is_group {
             return Err(EditError::IsGroup);
@@ -380,6 +421,26 @@ impl Editor {
         self.doc.layers.insert(at, layer);
         self.dirty_all();
         id
+    }
+
+    /// Camada de ajuste nova logo acima de `above`: aplica `filter` a tudo que está embaixo dela,
+    /// sem mexer nos pixels (dá para mudar ou apagar depois). Só filtros pontuais.
+    pub fn add_adjustment_layer(
+        &mut self,
+        filter: Filter,
+        name: Option<String>,
+        above: Option<LayerId>,
+    ) -> Result<LayerId, EditError> {
+        if !filter.is_pointwise() {
+            return Err(EditError::NotAdjustable);
+        }
+        let id = self.add_layer(Some(name.unwrap_or_else(|| "Ajuste".into())), above);
+        // `add_layer` já guardou o passo de desfazer ("Nova camada"); o nome certo vale mais.
+        if let Some((_, label)) = self.undo.last_mut() {
+            *label = "Camada de ajuste";
+        }
+        self.doc.layer_mut(id).expect("acabou de entrar").adjust = Some(filter);
+        Ok(id)
     }
 
     pub fn duplicate_layer(&mut self, id: LayerId) -> Result<LayerId, EditError> {
@@ -498,6 +559,9 @@ impl Editor {
         let this = &self.doc.layers[i];
         if this.is_group || below.is_group || this.parent != below.parent {
             return Err(EditError::NothingBelow);
+        }
+        if this.adjust.is_some() || below.adjust.is_some() {
+            return Err(EditError::IsAdjustment);
         }
         self.checkpoint("Unir com a de baixo");
         let top = self.doc.layers.remove(i);
@@ -668,12 +732,17 @@ impl Editor {
         erase: bool,
         mode: BlendMode,
     ) -> Result<(), EditError> {
-        self.layer_checked(layer)?;
+        let l = self.layer_for_paint(layer)?;
+        if l.adjust.is_some() && !(self.paint_mask && l.mask.is_some()) {
+            return Err(EditError::IsAdjustment);
+        }
         self.checkpoint(if erase { "Borracha" } else { "Pincel" });
         let mut stroker = Stroker::new(self.doc.width, self.doc.height);
         let opacity = brush.opacity;
         stroker.begin(brush, color, erase);
         stroker.mirror = self.mirror;
+        stroker.wrap = self.wrap;
+        stroker.radial = self.radial;
         let on_mask = self.paint_mask && self.doc.layer(layer).is_some_and(|l| l.mask.is_some());
         self.stroke = Some(ActiveStroke {
             on_mask,
@@ -723,6 +792,25 @@ impl Editor {
     pub fn stroke_point(&mut self, x: f32, y: f32) {
         if let Some(s) = &mut self.stroke {
             s.stroker.add_point(x, y);
+            let tiles = s.stroker.buf.take_dirty();
+            self.dirty_tiles(tiles);
+        }
+    }
+
+    /// O traço que começou agora copia de outro lugar da camada (carimbo de clone): cada pixel
+    /// pintado vem do pixel que está `offset` adiante, como estava quando o traço começou.
+    pub fn set_clone_source(&mut self, offset: (f32, f32)) {
+        let Some(s) = &mut self.stroke else { return };
+        let Some(layer) = self.doc.layer(s.layer) else {
+            return;
+        };
+        s.stroker.clone_src = Some((layer.pixels.clone(), offset));
+    }
+
+    /// Como `stroke_point`, com a pressão da caneta (0..1) neste ponto.
+    pub fn stroke_point_pressure(&mut self, x: f32, y: f32, pressure: f32) {
+        if let Some(s) = &mut self.stroke {
+            s.stroker.add_point_pressure(x, y, pressure);
             let tiles = s.stroker.buf.take_dirty();
             self.dirty_tiles(tiles);
         }
@@ -913,6 +1001,17 @@ impl Editor {
         filter: &Filter,
         label: &'static str,
     ) -> Result<(), EditError> {
+        // Numa camada de ajuste o "filtro" troca o ajuste dela (é o que o diálogo de filtro faz
+        // ao editar uma).
+        if self.layer_for_paint(id)?.adjust.is_some() {
+            if !filter.is_pointwise() {
+                return Err(EditError::NotAdjustable);
+            }
+            self.checkpoint(label);
+            self.doc.layer_mut(id).expect("existe").adjust = Some(filter.clone());
+            self.dirty_all();
+            return Ok(());
+        }
         let layer = self.layer_checked(id)?;
         let (sel, lock) = (self.doc.selection.clone(), layer.alpha_lock);
         self.checkpoint(label);
@@ -1273,6 +1372,10 @@ impl Editor {
         self.checkpoint(label);
         for l in &mut self.doc.layers {
             l.pixels = f(&l.pixels);
+            // A máscara acompanha a tela (antes ela ficava com o tamanho antigo).
+            if let Some(m) = &l.mask {
+                l.mask = Some(f(m));
+            }
         }
         self.doc.width = w;
         self.doc.height = h;
@@ -1823,6 +1926,467 @@ mod tests {
         e.jump_to(0);
         assert_eq!(e.doc().layers.len(), 1);
     }
+    // ---- carimbo de clone
+
+    #[test]
+    fn clone_stroke_copies_pixels_from_the_offset_position() {
+        let mut e = Editor::new(120, 80, Background::Transparent);
+        let id = top(&e);
+        // origem: um quadrado vermelho opaco em 10..30 x 10..30 (o resto transparente)
+        e.set_selection(Some(Selection::rect(120, 80, 10, 10, 30, 30)), "x");
+        e.fill_selection(id, [255, 0, 0]).unwrap();
+        e.deselect();
+        let brush = Brush {
+            size: 8.0,
+            hardness: 1.0,
+            spacing: 0.1,
+            ..Brush::basic()
+        };
+        // pinta em (80,20) copiando de 60 px à esquerda (cai no quadrado)
+        e.begin_stroke(id, brush.clone(), [0, 255, 0], false, BlendMode::Normal)
+            .unwrap();
+        e.set_clone_source((-60.0, 0.0));
+        e.stroke_point(80.0, 20.0);
+        e.stroke_point(84.0, 20.0);
+        e.end_stroke(84.0, 20.0);
+        let px = e.doc().layer(id).unwrap().pixels.pixel(82, 20);
+        assert_eq!(
+            px,
+            [255, 0, 0, 255],
+            "veio do quadrado vermelho, não do verde da cor"
+        );
+        // pinta onde a origem é transparente: não deixa nada
+        e.begin_stroke(id, brush.clone(), [0, 255, 0], false, BlendMode::Normal)
+            .unwrap();
+        e.set_clone_source((-60.0, 0.0));
+        e.stroke_point(80.0, 60.0);
+        e.end_stroke(80.0, 60.0);
+        assert_eq!(e.doc().layer(id).unwrap().pixels.pixel(80, 60)[3], 0);
+        // origem fora da imagem também não deixa nada nem quebra
+        e.begin_stroke(id, brush, [0, 255, 0], false, BlendMode::Normal)
+            .unwrap();
+        e.set_clone_source((-500.0, -500.0));
+        e.stroke_point(5.0, 5.0);
+        e.end_stroke(5.0, 5.0);
+        assert_eq!(e.doc().layer(id).unwrap().pixels.pixel(5, 5)[3], 0);
+    }
+
+    #[test]
+    fn new_features_survive_absurd_values() {
+        let weird = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1e30,
+            -1e30,
+            0.0,
+            -3.0,
+        ];
+        let mut e = ed();
+        let base = top(&e);
+        for &a in &weird {
+            // camadas de ajuste com números ruins
+            for f in [
+                Filter::BrightnessContrast {
+                    brightness: a,
+                    contrast: a,
+                },
+                Filter::HueSaturation {
+                    hue: a,
+                    saturation: a,
+                    lightness: a,
+                },
+                Filter::Levels {
+                    black: a,
+                    white: a,
+                    gamma: a,
+                },
+                Filter::Curves(vec![(a, a), (0.5, a), (a, 0.5)]),
+                Filter::Threshold(a),
+                Filter::Posterize(u32::MAX),
+            ] {
+                let id = e.add_adjustment_layer(f, None, Some(base)).unwrap();
+                let img = crate::composite::flatten(e.doc());
+                assert_eq!(img.width(), 100);
+                e.delete_layer(id).unwrap();
+            }
+            // carimbo de clone, simetria, mosaico e pressão com valores ruins
+            e.set_radial(if a.is_finite() { a as u32 } else { 7 });
+            e.set_wrap(true);
+            e.begin_stroke(base, Brush::basic(), [1, 2, 3], false, BlendMode::Normal)
+                .unwrap();
+            e.set_clone_source((a, a));
+            e.stroke_point_pressure(a, a, a);
+            e.stroke_point_pressure(10.0, 10.0, a);
+            e.end_stroke(a, a);
+            e.set_radial(1);
+            e.set_wrap(false);
+        }
+        assert!(e.doc().layer(base).is_some());
+    }
+
+    /// Operações aleatórias em sequência (desfazer e refazer no meio): nenhuma derruba o editor e o
+    /// documento fica coerente (pastas existem, todas as camadas têm o tamanho da tela, a imagem
+    /// final se compõe).
+    #[test]
+    fn monkey_test_keeps_the_document_consistent() {
+        use crate::selection::{SelOp, Selection};
+        fn check(e: &Editor, step: usize, seed: u64) {
+            let d = e.doc();
+            for l in &d.layers {
+                if let Some(p) = l.parent {
+                    let g = d
+                        .layer(p)
+                        .unwrap_or_else(|| panic!("seed {seed} passo {step}: pasta {p} sumiu"));
+                    assert!(g.is_group, "seed {seed} passo {step}: pai não é pasta");
+                }
+                if !l.is_group {
+                    assert_eq!(
+                        (l.pixels.width(), l.pixels.height()),
+                        (d.width, d.height),
+                        "seed {seed} passo {step}: camada {} com outro tamanho",
+                        l.name
+                    );
+                }
+                if let Some(m) = &l.mask {
+                    assert_eq!((m.width(), m.height()), (d.width, d.height), "máscara");
+                }
+            }
+            let img = crate::composite::flatten(d);
+            assert_eq!(
+                (img.width() as usize, img.height() as usize),
+                (d.width, d.height)
+            );
+        }
+        for seed in 1..=4u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rnd = move |n: usize| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % n.max(1) as u64) as usize
+            };
+            let mut e = Editor::new(80, 60, Background::White);
+            for step in 0..120 {
+                let layers: Vec<LayerId> = e.doc().layers.iter().map(|l| l.id).collect();
+                let pick = |r: usize| layers[r % layers.len().max(1)];
+                let id = pick(rnd(100));
+                let (px, py) = (rnd(90) as f32 - 5.0, rnd(70) as f32 - 5.0);
+                match rnd(26) {
+                    0 => {
+                        e.add_layer(None, Some(id));
+                    }
+                    1 => {
+                        e.add_group(Some(id));
+                    }
+                    2 => {
+                        let g = pick(rnd(100));
+                        let _ = e.set_parent(id, Some(g));
+                    }
+                    3 => {
+                        let _ = e.set_parent(id, None);
+                    }
+                    4 => e.move_layer(
+                        id,
+                        [MoveTo::Up, MoveTo::Down, MoveTo::Top, MoveTo::Bottom][rnd(4)],
+                    ),
+                    5 => {
+                        let _ = e.duplicate_layer(id);
+                    }
+                    6 => {
+                        if layers.len() > 1 {
+                            let _ = e.delete_layer(id);
+                        }
+                    }
+                    7 => {
+                        let _ = e.merge_down(id);
+                    }
+                    8 => {
+                        let _ = e.add_mask(id);
+                    }
+                    9 => {
+                        let _ = e.remove_mask(id, rnd(2) == 0);
+                    }
+                    10 => {
+                        let f = [
+                            Filter::Invert,
+                            Filter::Desaturate,
+                            Filter::Threshold(0.5),
+                            Filter::Posterize(4),
+                            Filter::Curves(vec![(0.0, 0.2), (1.0, 0.8)]),
+                        ][rnd(5)]
+                        .clone();
+                        let _ = e.add_adjustment_layer(f, None, Some(id));
+                    }
+                    11 | 12 => {
+                        let mut b = Brush {
+                            size: 2.0 + rnd(30) as f32,
+                            hardness: rnd(100) as f32 / 100.0,
+                            spacing: 0.05 + rnd(30) as f32 / 100.0,
+                            ..Brush::basic()
+                        };
+                        if rnd(3) == 0 {
+                            b.spray = rnd(30) as u32;
+                        }
+                        if rnd(3) == 0 {
+                            b.dynamics.size = crate::brush::Sensor::Pressure;
+                        }
+                        e.set_wrap(rnd(3) == 0);
+                        e.set_radial(1 + rnd(5) as u32);
+                        e.set_mirror(rnd(4) == 0, rnd(4) == 0);
+                        e.set_paint_mask(rnd(4) == 0);
+                        if e.begin_stroke(
+                            id,
+                            b,
+                            [rnd(256) as u8, 9, 9],
+                            rnd(5) == 0,
+                            BlendMode::Normal,
+                        )
+                        .is_ok()
+                        {
+                            if rnd(4) == 0 {
+                                e.set_clone_source((rnd(40) as f32 - 20.0, 5.0));
+                            }
+                            for k in 0..4 {
+                                e.stroke_point_pressure(
+                                    px + k as f32 * 6.0,
+                                    py + k as f32,
+                                    rnd(100) as f32 / 100.0,
+                                );
+                            }
+                            e.end_stroke(px + 24.0, py + 4.0);
+                        }
+                        e.set_wrap(false);
+                        e.set_radial(1);
+                        e.set_mirror(false, false);
+                        e.set_paint_mask(false);
+                    }
+                    13 => {
+                        let _ = e.bucket_fill(
+                            id,
+                            (px.max(0.0) as usize, py.max(0.0) as usize),
+                            [1, 200, 3],
+                            0.3,
+                            rnd(2) == 0,
+                            1.0,
+                            rnd(2) == 0,
+                        );
+                    }
+                    14 => {
+                        let (dw, dh) = (e.doc().width, e.doc().height);
+                        e.set_selection(
+                            Some(Selection::rect(
+                                dw,
+                                dh,
+                                px as i64,
+                                py as i64,
+                                px as i64 + 30,
+                                py as i64 + 20,
+                            )),
+                            "sel",
+                        );
+                        let _ = e.fill_selection(id, [200, 100, 0]);
+                    }
+                    15 => {
+                        let _ = e.apply_filter(
+                            id,
+                            &Filter::HueSaturation {
+                                hue: 40.0,
+                                saturation: 0.2,
+                                lightness: 0.0,
+                            },
+                            "f",
+                        );
+                    }
+                    16 => {
+                        let _ = e.apply_filter(id, &Filter::GaussianBlur(1.0 + rnd(5) as f32), "f");
+                    }
+                    17 => {
+                        e.undo();
+                    }
+                    18 => {
+                        e.redo();
+                    }
+                    19 => {
+                        e.jump_to(rnd(6));
+                    }
+                    20 => e.crop(rnd(10), rnd(10), 40 + rnd(40), 30 + rnd(30)),
+                    21 => e.resize_canvas(
+                        40 + rnd(80),
+                        30 + rnd(60),
+                        rnd(20) as i64 - 10,
+                        rnd(20) as i64 - 10,
+                    ),
+                    22 => e.rotate_image(rnd(2) == 0),
+                    23 => e.flip_image(rnd(2) == 0),
+                    24 => {
+                        if rnd(4) == 0 {
+                            e.flatten();
+                        }
+                    }
+                    _ => {
+                        e.combine_selection(
+                            Selection::rect(e.doc().width, e.doc().height, 5, 5, 40, 30),
+                            [SelOp::Replace, SelOp::Add, SelOp::Subtract][rnd(3)],
+                            "sel",
+                        );
+                    }
+                }
+                check(&e, step, seed);
+            }
+        }
+    }
+
+    // ---- camadas de ajuste
+
+    fn pix(e: &Editor, x: u32, y: u32) -> [u8; 4] {
+        crate::composite::flatten(e.doc()).get_pixel(x, y).0
+    }
+
+    #[test]
+    fn adjustment_layer_changes_what_is_below_without_touching_pixels() {
+        let mut e = Editor::new(100, 80, Background::Color([200, 100, 50]));
+        let base = top(&e);
+        let adj = e
+            .add_adjustment_layer(Filter::Invert, None, Some(base))
+            .unwrap();
+        assert_eq!(pix(&e, 10, 10), [55, 155, 205, 255]);
+        // os pixels de verdade seguem intactos
+        assert_eq!(
+            e.doc().layer(base).unwrap().pixels.pixel(10, 10),
+            [200, 100, 50, 255]
+        );
+        // opacidade 50 % mistura o original com o ajustado
+        e.doc_mut_for_test().layer_mut(adj).unwrap().opacity = 0.5;
+        let p = pix(&e, 10, 10);
+        assert!(
+            (p[0] as i32 - 128).abs() <= 1 && (p[1] as i32 - 128).abs() <= 1,
+            "{p:?}"
+        );
+        // escondida: tudo como era
+        e.doc_mut_for_test().layer_mut(adj).unwrap().visible = false;
+        assert_eq!(pix(&e, 10, 10), [200, 100, 50, 255]);
+        // um passo de desfazer cria, outro tira
+        assert_eq!(e.undo_label(), Some("Camada de ajuste"));
+        e.undo();
+        assert!(e.doc().layers.iter().all(|l| l.adjust.is_none()));
+    }
+
+    #[test]
+    fn adjustment_only_affects_layers_below_and_respects_its_mask() {
+        let mut e = Editor::new(100, 80, Background::White);
+        let base = top(&e);
+        let adj = e
+            .add_adjustment_layer(Filter::Invert, None, Some(base))
+            .unwrap();
+        // uma camada vermelha POR CIMA do ajuste não é afetada
+        let above = e.add_layer(None, Some(adj));
+        e.fill_selection(above, [255, 0, 0]).ok();
+        e.select_all();
+        e.fill_selection(above, [255, 0, 0]).unwrap();
+        e.deselect();
+        assert_eq!(pix(&e, 5, 5), [255, 0, 0, 255]);
+        e.doc_mut_for_test().layer_mut(above).unwrap().visible = false;
+        assert_eq!(pix(&e, 5, 5), [0, 0, 0, 255], "branco invertido");
+        // máscara: pintar de preto esconde o ajuste (preto = esconde) na região
+        e.add_mask(adj).unwrap();
+        e.set_paint_mask(true);
+        e.begin_stroke(
+            adj,
+            Brush {
+                size: 30.0,
+                hardness: 1.0,
+                ..Brush::basic()
+            },
+            [0, 0, 0],
+            false,
+            BlendMode::Normal,
+        )
+        .unwrap();
+        e.stroke_point(20.0, 20.0);
+        e.end_stroke(20.0, 20.0);
+        assert_eq!(
+            pix(&e, 20, 20),
+            [255, 255, 255, 255],
+            "ajuste escondido onde a máscara pintou"
+        );
+        assert_eq!(
+            pix(&e, 80, 60),
+            [0, 0, 0, 255],
+            "longe da máscara o ajuste vale"
+        );
+    }
+
+    #[test]
+    fn adjustment_layers_refuse_pixel_edits_and_neighbor_filters() {
+        let mut e = ed();
+        let base = top(&e);
+        assert_eq!(
+            e.add_adjustment_layer(Filter::GaussianBlur(4.0), None, Some(base)),
+            Err(EditError::NotAdjustable)
+        );
+        let adj = e
+            .add_adjustment_layer(Filter::Desaturate, None, Some(base))
+            .unwrap();
+        // pintar nos pixels: recusa; filtro vizinho: recusa; juntar: recusa
+        assert_eq!(
+            e.begin_stroke(adj, Brush::basic(), [0; 3], false, BlendMode::Normal),
+            Err(EditError::IsAdjustment)
+        );
+        assert_eq!(
+            e.apply_filter(adj, &Filter::GaussianBlur(3.0), "x"),
+            Err(EditError::NotAdjustable)
+        );
+        assert_eq!(e.merge_down(adj), Err(EditError::IsAdjustment));
+        assert_eq!(
+            e.fill_selection(adj, [1, 2, 3]),
+            Err(EditError::IsAdjustment)
+        );
+        // um filtro pontual troca o ajuste
+        e.apply_filter(adj, &Filter::Invert, "Filtro").unwrap();
+        assert_eq!(e.doc().layer(adj).unwrap().adjust, Some(Filter::Invert));
+        // duplicar leva o ajuste junto
+        let copy = e.duplicate_layer(adj).unwrap();
+        assert_eq!(e.doc().layer(copy).unwrap().adjust, Some(Filter::Invert));
+    }
+
+    #[test]
+    fn adjustment_inside_a_folder_only_affects_the_folder() {
+        let mut e = Editor::new(100, 80, Background::White);
+        let base = top(&e); // fundo branco fora da pasta
+        let folder = e.add_group(Some(base));
+        let inner = e.add_layer(None, Some(folder));
+        e.select_all();
+        e.fill_selection(inner, [200, 200, 200]).unwrap();
+        e.deselect();
+        e.add_adjustment_layer(Filter::Invert, None, Some(inner))
+            .unwrap();
+        // a pasta mostra o cinza invertido por cima do fundo branco, que não mudou
+        assert_eq!(pix(&e, 5, 5), [55, 55, 55, 255]);
+        let bg = e.doc().layer(base).unwrap().pixels.pixel(5, 5);
+        assert_eq!(bg, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn adjustment_survives_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = ed();
+        let base = top(&e);
+        let adj = e
+            .add_adjustment_layer(
+                Filter::Curves(vec![(0.0, 0.0), (0.5, 0.7), (1.0, 1.0)]),
+                Some("Luz".into()),
+                Some(base),
+            )
+            .unwrap();
+        let path = dir.path().join("a.pawpaint");
+        crate::file::save_project(&e, &path).unwrap();
+        let back = crate::file::load_project(&path).unwrap();
+        let l = back.doc().layer(adj).unwrap();
+        assert_eq!(l.name, "Luz");
+        assert!(matches!(&l.adjust, Some(Filter::Curves(p)) if p.len() == 3));
+        assert_eq!(pix(&back, 3, 3), pix(&e, 3, 3));
+    }
 }
 
 #[cfg(test)]
@@ -1867,6 +2431,40 @@ mod perf_probe {
         let t = Instant::now();
         e.apply_filter(id, &Filter::GaussianBlur(8.0), "b").unwrap();
         println!("blur: {:?}", t.elapsed());
+        // três camadas de ajuste por cima: o custo extra da composição
+        for f in [
+            Filter::HueSaturation {
+                hue: 20.0,
+                saturation: 0.2,
+                lightness: 0.0,
+            },
+            Filter::Curves(vec![(0.0, 0.0), (0.5, 0.6), (1.0, 1.0)]),
+            Filter::BrightnessContrast {
+                brightness: 0.1,
+                contrast: 0.1,
+            },
+        ] {
+            e.add_adjustment_layer(f, None, None).unwrap();
+        }
+        let t = Instant::now();
+        let mut n = 0;
+        for ty in 0..64 {
+            for tx in 0..64 {
+                n += composite::composite_tile(e.doc(), tx, ty, None).len();
+            }
+        }
+        println!(
+            "full composite with 3 adjustment layers ({n} bytes): {:?}",
+            t.elapsed()
+        );
+        let t = Instant::now();
+        let img = composite::flatten(e.doc());
+        println!(
+            "flatten with 3 adjustments ({}x{}): {:?}",
+            img.width(),
+            img.height(),
+            t.elapsed()
+        );
     }
 
     /// Valores absurdos (NaN, infinito, enormes, negativos, vazios) em tudo que recebe números do

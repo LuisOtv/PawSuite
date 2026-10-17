@@ -26,7 +26,12 @@ pub enum FileError {
     Image(#[from] image::ImageError),
     #[error("projeto de uma versão mais nova do PawPaint")]
     TooNew,
+    #[error("projeto corrompido: {0}")]
+    Corrupt(&'static str),
 }
+
+/// Maior lado de imagem que o PawPaint aceita (o mesmo limite do editor).
+const MAX_SIDE: usize = 16384;
 
 #[derive(Serialize, Deserialize)]
 struct LayerMeta {
@@ -46,6 +51,8 @@ struct LayerMeta {
     parent: Option<u64>,
     #[serde(default = "yes")]
     expanded: bool,
+    #[serde(default)]
+    adjust: Option<crate::filters::Filter>,
 }
 
 fn yes() -> bool {
@@ -130,6 +137,7 @@ pub fn save_doc(doc: &Doc, path: &Path, speed: SaveSpeed) -> Result<(), FileErro
             is_group: l.is_group,
             parent: l.parent,
             expanded: l.expanded,
+            adjust: l.adjust.clone(),
         });
     }
     // Imagem final, para miniaturas em gerenciadores de arquivos.
@@ -210,11 +218,19 @@ pub fn load_project(path: &Path) -> Result<Editor, FileError> {
     if meta.version > VERSION {
         return Err(FileError::TooNew);
     }
+    if !(1..=MAX_SIDE).contains(&meta.width) || !(1..=MAX_SIDE).contains(&meta.height) {
+        return Err(FileError::Corrupt("tamanho da imagem fora do limite"));
+    }
     let mut doc = Doc::new(meta.width, meta.height);
     for m in meta.layers {
         let mut bytes = Vec::new();
         zip.by_name(&m.file)?.read_to_end(&mut bytes)?;
         let img = image::load_from_memory(&bytes)?.to_rgba8();
+        if img.width() as usize != meta.width || img.height() as usize != meta.height {
+            return Err(FileError::Corrupt(
+                "camada com tamanho diferente do documento",
+            ));
+        }
         let mut l = Layer::new(m.id, m.name, meta.width, meta.height);
         l.visible = m.visible;
         l.locked = m.locked;
@@ -224,18 +240,49 @@ pub fn load_project(path: &Path) -> Result<Editor, FileError> {
         l.is_group = m.is_group;
         l.parent = m.parent;
         l.expanded = m.expanded;
+        l.adjust = m.adjust.clone();
         l.pixels = TiledImage::from_rgba(&img);
         if let Some(mn) = &m.mask {
             let mut mb = Vec::new();
             zip.by_name(mn)?.read_to_end(&mut mb)?;
             // Na máscara só o alfa importa (quanto está escondido).
-            l.mask = Some(TiledImage::from_rgba(
-                &image::load_from_memory(&mb)?.to_rgba8(),
-            ));
+            let mimg = image::load_from_memory(&mb)?.to_rgba8();
+            if mimg.width() as usize != meta.width || mimg.height() as usize != meta.height {
+                return Err(FileError::Corrupt(
+                    "máscara com tamanho diferente do documento",
+                ));
+            }
+            l.mask = Some(TiledImage::from_rgba(&mimg));
         }
         doc.layers.push(l);
     }
-    doc.set_next_id(meta.next_id);
+    // Pai que não existe, que não é grupo ou que forma um ciclo: a camada volta para a raiz.
+    let ids: Vec<(u64, bool, Option<u64>)> = doc
+        .layers
+        .iter()
+        .map(|l| (l.id, l.is_group, l.parent))
+        .collect();
+    let parent_of = |id: u64| ids.iter().find(|x| x.0 == id).and_then(|x| x.2);
+    for l in &mut doc.layers {
+        let Some(mut p) = l.parent else { continue };
+        let mut ok = true;
+        for _ in 0..=ids.len() {
+            if p == l.id || !ids.iter().any(|x| x.0 == p && x.1) {
+                ok = false;
+                break;
+            }
+            match parent_of(p) {
+                Some(next) => p = next,
+                None => break,
+            }
+        }
+        if !ok || parent_of(p).is_some() {
+            l.parent = None;
+        }
+    }
+    // O contador de ids nunca pode ficar atrás de um id que já existe.
+    let max_id = doc.layers.iter().map(|l| l.id).max().unwrap_or(0);
+    doc.set_next_id(meta.next_id.max(max_id + 1));
     Ok(Editor::from_doc(doc))
 }
 

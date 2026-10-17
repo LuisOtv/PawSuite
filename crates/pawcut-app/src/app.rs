@@ -57,6 +57,7 @@ impl TabViewer for Workspace {
             Panel::TimelineViewer => self.timeline_viewer_ui(ui),
             Panel::Inspector => self.inspector_ui(ui),
             Panel::Timeline => self.timeline_ui(ui),
+            Panel::Notes => self.notes_ui(ui),
         }
     }
 }
@@ -90,6 +91,8 @@ impl PawCutApp {
             ctx,
             AppState::new(pawcut_core::Project::new(Default::default())),
         );
+        ws.presets_path = Some(crate::config::presets_path());
+        ws.presets = crate::presets::load(&crate::config::presets_path());
         if !args.is_empty() {
             ws.open_paths(args);
         }
@@ -253,6 +256,12 @@ impl PawCutApp {
                 self.item(ui, "Extrair In/Out (fecha o buraco)", Action::ExtractInOut);
                 self.item(ui, "Levantar In/Out (deixa o buraco)", Action::LiftInOut);
                 self.item(ui, "Ligar / separar áudio e vídeo", Action::LinkUnlink);
+                self.item(ui, "Alinhar clipes pelo áudio", Action::AlignAudio);
+                self.item(
+                    ui,
+                    "Transcrever o áudio em legendas (whisper)",
+                    Action::Transcribe,
+                );
                 ui.separator();
                 self.item(ui, "Insert do Source", Action::InsertEdit);
                 self.item(ui, "Overwrite do Source", Action::OverwriteEdit);
@@ -283,6 +292,13 @@ impl PawCutApp {
                 self.item(ui, "Empurrar 1 frame para trás", Action::NudgeLeft);
                 self.item(ui, "Empurrar 1 frame para frente", Action::NudgeRight);
                 self.item(ui, "Mostrar no Media Pool", Action::ShowInPool);
+                if ui
+                    .button("Slideshow com as imagens do Media Pool…")
+                    .clicked()
+                {
+                    ui.close();
+                    self.ws.slideshow = Some((3.0, 0.5));
+                }
                 ui.separator();
                 if ui.button("Adicionar faixa de vídeo").clicked() {
                     ui.close();
@@ -348,26 +364,18 @@ impl PawCutApp {
                 (Panel::Inspector, Icon::Inspector, "Inspector"),
             ] {
                 let on = self.layout.is_visible(panel);
-                if icons::button(ui, icon, 15.0, on, label).clicked() {
+                if icons::button_labeled(ui, icon, 15.0, on, label, "").clicked() {
                     self.toggle_panel(panel);
                 }
-                ui.label(egui::RichText::new(label).size(11.5).color(if on {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_DIM
-                }));
-                ui.add_space(10.0);
+                ui.add_space(2.0);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Deliver: abre a janela de exportação (fecha se não estiver exportando).
                 let open = self.ws.deliver.is_some();
                 let tip = self.ws.tip("Exportar o vídeo", Action::Deliver);
-                ui.label(egui::RichText::new("Deliver").size(11.5).color(if open {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_DIM
-                }));
-                if icons::button(ui, Icon::DeliverPage, 15.0, open, &tip).clicked() {
+                if icons::button_labeled(ui, Icon::DeliverPage, 15.0, open, "Deliver", &tip)
+                    .clicked()
+                {
                     if !open {
                         self.ws.open_deliver();
                     } else if !self.ws.deliver.as_ref().is_some_and(|d| d.job.is_some()) {

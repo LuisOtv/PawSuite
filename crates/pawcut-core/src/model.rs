@@ -311,10 +311,112 @@ pub struct Clip {
     pub blur_fill: bool,
     #[serde(default)]
     pub chroma: Option<ChromaKey>,
+    /// Efeitos de áudio do clipe, aplicados em ordem (limpeza de voz: filtro, gate, compressor…).
+    #[serde(default)]
+    pub audio_fx: Vec<AudioFx>,
 }
 
 fn linear() -> Ease {
     Ease::Linear
+}
+
+/// Um efeito de áudio de um clipe. Os valores são validados pelo `Editor` (limites em `check`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AudioFx {
+    /// Tira o ronco abaixo de `hz`.
+    HighPass { hz: f32 },
+    /// Abaixa o chiado nas pausas.
+    NoiseGate {
+        threshold_db: f32,
+        reduction_db: f32,
+    },
+    /// Nivela a voz: limiar, razão, ataque e soltura (ms) e ganho de volta.
+    Compressor {
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        makeup_db: f32,
+    },
+    /// Tira o chiado dos "s".
+    DeEss {
+        threshold_db: f32,
+        reduction_db: f32,
+    },
+    /// Graves (250 Hz), médios (1 kHz) e agudos (4 kHz) em dB.
+    Eq3 {
+        bass_db: f32,
+        mid_db: f32,
+        treble_db: f32,
+    },
+    /// Corta uma frequência (zumbido).
+    Notch { hz: f32 },
+    /// Eco de sala.
+    Reverb { room: f32, wet_db: f32 },
+}
+
+impl AudioFx {
+    /// Todos os valores dentro dos limites que o processamento aguenta.
+    pub fn is_valid(&self) -> bool {
+        let r = |v: f32, lo: f32, hi: f32| v.is_finite() && (lo..=hi).contains(&v);
+        match self {
+            AudioFx::HighPass { hz } => r(*hz, 20.0, 400.0),
+            AudioFx::NoiseGate {
+                threshold_db,
+                reduction_db,
+            } => r(*threshold_db, -80.0, 0.0) && r(*reduction_db, 0.0, 60.0),
+            AudioFx::Compressor {
+                threshold_db,
+                ratio,
+                attack_ms,
+                release_ms,
+                makeup_db,
+            } => {
+                r(*threshold_db, -60.0, 0.0)
+                    && r(*ratio, 1.0, 20.0)
+                    && r(*attack_ms, 0.1, 500.0)
+                    && r(*release_ms, 5.0, 3000.0)
+                    && r(*makeup_db, 0.0, 24.0)
+            }
+            AudioFx::DeEss {
+                threshold_db,
+                reduction_db,
+            } => r(*threshold_db, -60.0, 0.0) && r(*reduction_db, 0.0, 24.0),
+            AudioFx::Eq3 {
+                bass_db,
+                mid_db,
+                treble_db,
+            } => r(*bass_db, -18.0, 18.0) && r(*mid_db, -18.0, 18.0) && r(*treble_db, -18.0, 18.0),
+            AudioFx::Notch { hz } => r(*hz, 20.0, 12_000.0),
+            AudioFx::Reverb { room, wet_db } => r(*room, 0.0, 1.0) && r(*wet_db, -40.0, 0.0),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AudioFx::HighPass { .. } => "Filtro de graves",
+            AudioFx::NoiseGate { .. } => "Noise gate",
+            AudioFx::Compressor { .. } => "Compressor",
+            AudioFx::DeEss { .. } => "De-esser",
+            AudioFx::Eq3 { .. } => "Equalizador",
+            AudioFx::Notch { .. } => "Notch",
+            AudioFx::Reverb { .. } => "Reverb",
+        }
+    }
+}
+
+/// Identifica uma lista de efeitos (para guardar o áudio já processado): 0 quando não há nenhum.
+pub fn audio_fx_key(fx: &[AudioFx]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    if fx.is_empty() {
+        return 0;
+    }
+    let mut h = DefaultHasher::new();
+    for f in fx {
+        // Debug é estável para estes tipos e dispensa `Hash` em f32
+        format!("{f:?}").hash(&mut h);
+    }
+    h.finish() | 1
 }
 
 /// Chroma key: some com a cor (verde/azul) dentro da tolerância.
@@ -521,6 +623,9 @@ pub struct Project {
     pub audio_tracks: Vec<Track>,
     #[serde(default)]
     pub markers: Vec<Marker>,
+    /// Anotações livres do projeto (roteiro, pendências, créditos).
+    #[serde(default)]
+    pub notes: String,
     pub(crate) ids: IdGen,
 }
 
@@ -534,6 +639,7 @@ impl Project {
             video_tracks: Vec::new(),
             audio_tracks: Vec::new(),
             markers: Vec::new(),
+            notes: String::new(),
             ids: IdGen::default(),
         };
         p.add_track(TrackKind::Video);
@@ -696,6 +802,7 @@ mod tests {
             dissolve_color: None,
             blur_fill: false,
             chroma: None,
+            audio_fx: Vec::new(),
         }
     }
 

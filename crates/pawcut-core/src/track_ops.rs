@@ -115,6 +115,7 @@ mod tests {
             dissolve_color: None,
             blur_fill: false,
             chroma: None,
+            audio_fx: Vec::new(),
         }
     }
 

@@ -52,6 +52,10 @@ fn composite_level(
             }
             continue;
         }
+        if let Some(f) = &layer.adjust {
+            adjust_below(doc, layer, f, &mut out, tx, ty, live);
+            continue;
+        }
         let base = layer.pixels.tile(tx, ty);
         let stroke = live
             .filter(|l| l.layer == layer.id)
@@ -123,6 +127,99 @@ fn composite_level(
     out
 }
 
+/// Camada de ajuste: o que já foi composto embaixo ganha o filtro, na força da opacidade e
+/// só onde a máscara não esconde (a máscara em pintura aparece na hora).
+fn adjust_below(
+    doc: &Doc,
+    layer: &crate::doc::Layer,
+    filter: &crate::filters::Filter,
+    out: &mut [u8],
+    tx: usize,
+    ty: usize,
+    live: Option<&Live>,
+) {
+    let stroke = live
+        .filter(|l| l.layer == layer.id && l.on_mask)
+        .and_then(|l| l.buf.tile(tx, ty).map(|s| (l, s)));
+    let mask: Option<Vec<u8>> = match (layer.mask.as_ref().and_then(|m| m.tile(tx, ty)), stroke) {
+        (m, Some((l, s))) => {
+            let mut t = m.map_or_else(|| vec![0u8; TILE_BYTES], <[u8]>::to_vec);
+            let sel = doc.selection.as_ref().map(|s| s.tile_mask(tx, ty));
+            apply_mask_stroke(&mut t, s, l.opacity, l.erase, sel.as_deref());
+            Some(t)
+        }
+        (Some(m), None) => Some(m.to_vec()),
+        (None, None) => None,
+    };
+    let mut adjusted = [0u8; TILE_BYTES];
+    adjusted.copy_from_slice(out);
+    crate::filters::apply_to_tile(filter, &mut adjusted);
+    for p in 0..TILE * TILE {
+        let i = p * 4;
+        if out[i + 3] == 0 {
+            continue;
+        }
+        let hide = mask.as_ref().map_or(0, |m| m[i + 3]);
+        let t = layer.opacity.clamp(0.0, 1.0) * (255 - hide) as f32 / 255.0;
+        if t <= 0.0 {
+            continue;
+        }
+        for c in 0..4 {
+            let (a, b) = (out[i + c] as f32, adjusted[i + c] as f32);
+            out[i + c] = (a + (b - a) * t).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// Quantos pixels existem de cada valor (0..=255) em cada canal, e na luminosidade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Histogram {
+    pub r: [u32; 256],
+    pub g: [u32; 256],
+    pub b: [u32; 256],
+    pub luma: [u32; 256],
+    /// Pixels contados (os que têm alguma tinta).
+    pub counted: u64,
+}
+
+/// Histograma da imagem final (todas as camadas visíveis, com os ajustes). Só conta pixels com
+/// alguma opacidade; `step` olha 1 pixel a cada `step` em cada direção (rápido em fotos grandes).
+pub fn histogram(doc: &Doc, step: usize) -> Histogram {
+    let step = step.clamp(1, 64);
+    let mut h = Histogram {
+        r: [0; 256],
+        g: [0; 256],
+        b: [0; 256],
+        luma: [0; 256],
+        counted: 0,
+    };
+    for ty in 0..doc.height.div_ceil(TILE) {
+        for tx in 0..doc.width.div_ceil(TILE) {
+            let t = composite_tile(doc, tx, ty, None);
+            let (tw, th) = (
+                TILE.min(doc.width - tx * TILE),
+                TILE.min(doc.height - ty * TILE),
+            );
+            for y in (0..th).step_by(step) {
+                for x in (0..tw).step_by(step) {
+                    let i = (y * TILE + x) * 4;
+                    if t[i + 3] == 0 {
+                        continue;
+                    }
+                    let [r, g, b, _] = unpremultiply([t[i], t[i + 1], t[i + 2], t[i + 3]]);
+                    h.r[r as usize] += 1;
+                    h.g[g as usize] += 1;
+                    h.b[b as usize] += 1;
+                    let l = (299 * r as u32 + 587 * g as u32 + 114 * b as u32 + 500) / 1000;
+                    h.luma[l.min(255) as usize] += 1;
+                    h.counted += 1;
+                }
+            }
+        }
+    }
+    h
+}
+
 /// A imagem final (alfa direto) com todas as camadas visíveis. As faixas de blocos são
 /// compostas em paralelo, cada thread escrevendo direto nas suas linhas.
 pub fn flatten(doc: &Doc) -> RgbaImage {
@@ -185,6 +282,40 @@ mod tests {
         assert_eq!(flatten(&d).get_pixel(70, 70).0, [100, 0, 0, 255]);
         d.layers[1].visible = false;
         assert_eq!(flatten(&d).get_pixel(70, 70).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn histogram_counts_each_channel_and_ignores_transparent_pixels() {
+        let mut doc = doc_with_two();
+        for l in &mut doc.layers {
+            l.visible = false;
+        }
+        let id = doc.layers[0].id;
+        let (w, h) = (doc.width, doc.height);
+        let l = doc.layer_mut(id).unwrap();
+        l.visible = true;
+        l.opacity = 1.0;
+        for y in 0..h {
+            for x in 0..w {
+                // metade esquerda vermelha opaca; o resto transparente
+                if x < w / 2 {
+                    l.pixels.set_pixel(x, y, [255, 0, 0, 255]);
+                } else {
+                    l.pixels.set_pixel(x, y, [0, 0, 0, 0]);
+                }
+            }
+        }
+        let hist = histogram(&doc, 1);
+        let half = (w / 2 * h) as u32;
+        assert_eq!(hist.counted, half as u64);
+        assert_eq!((hist.r[255], hist.g[0], hist.b[0]), (half, half, half));
+        assert_eq!(hist.r[0], 0);
+        // vermelho puro: luminosidade 0,299 · 255 ≈ 76
+        assert_eq!(hist.luma[76], half);
+        // olhando 1 pixel a cada 4, a contagem cai na proporção (e nada passa dos limites)
+        let coarse = histogram(&doc, 4);
+        assert!(coarse.counted * 8 < hist.counted && coarse.counted > 0);
+        assert!(histogram(&doc, 0).counted == hist.counted, "passo 0 vira 1");
     }
 
     #[test]

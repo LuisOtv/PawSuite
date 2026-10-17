@@ -268,19 +268,25 @@ pub fn layers(st: &mut State, ui: &mut egui::Ui) {
             {
                 st.docs[cur].edit_mask = on;
             }
-            if ui
-                .small_button("Aplicar")
-                .on_hover_text("Passa o que está escondido para os pixels")
-                .clicked()
+            if paw_ui::icons::button(
+                ui,
+                Icon::Check,
+                14.0,
+                false,
+                "Aplicar a máscara: passa o que está escondido para os pixels",
+            )
+            .clicked()
             {
                 let _ = st.docs[cur].ed.remove_mask(active, true);
                 st.docs[cur].edit_mask = false;
             }
-            if ui.small_button("Apagar máscara").clicked() {
+            if paw_ui::icons::button(ui, Icon::Trash, 14.0, false, "Apagar a máscara").clicked() {
                 let _ = st.docs[cur].ed.remove_mask(active, false);
                 st.docs[cur].edit_mask = false;
             }
-        } else if ui.button("+ Máscara").clicked() {
+        } else if paw_ui::icons::button(ui, Icon::Mask, 14.0, false, "Adicionar máscara à camada")
+            .clicked()
+        {
             let _ = st.docs[cur].ed.add_mask(active);
             st.docs[cur].edit_mask = true;
         }
@@ -428,8 +434,24 @@ fn layer_row(st: &mut State, ui: &mut egui::Ui, id: u64, depth: usize) {
         );
         toggle_group = ar.clicked();
     }
+    // Camada de ajuste: um círculo meio cheio no lugar da miniatura.
+    if l.adjust.is_some() {
+        let c = rect.min + vec2(42.0, 14.0);
+        let p = ui.painter();
+        p.circle_stroke(c, 8.0, Stroke::new(1.5, theme::TEXT));
+        p.add(egui::Shape::convex_polygon(
+            (0..=16)
+                .map(|i| {
+                    let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 16.0;
+                    c + vec2(a.cos(), a.sin()) * 8.0
+                })
+                .collect(),
+            theme::TEXT,
+            Stroke::NONE,
+        ));
+    }
     // Miniatura: amostra a camada com passo fixo (rápido, mesmo em telas grandes).
-    if !l.is_group {
+    if !l.is_group && l.adjust.is_none() {
         let rev = st.docs[cur].ed.pixel_rev();
         if st.docs[cur].thumbs.get(&id).is_none_or(|(r, _)| *r != rev) {
             let (w, h) = (l.pixels.width().max(1), l.pixels.height().max(1));
@@ -575,10 +597,18 @@ fn layer_row(st: &mut State, ui: &mut egui::Ui, id: u64, depth: usize) {
         st.docs[cur].active = id;
     }
     if resp.double_clicked() {
-        st.renaming = Some((id, l.name.clone()));
+        if l.adjust.is_some() {
+            crate::app::edit_adjustment(st, id);
+        } else {
+            st.renaming = Some((id, l.name.clone()));
+        }
     }
     resp.context_menu(|ui| {
         st.docs[cur].active = id;
+        if l.adjust.is_some() && ui.button("Editar ajuste…").clicked() {
+            ui.close();
+            crate::app::edit_adjustment(st, id);
+        }
         if ui.button("Renomear").clicked() {
             ui.close();
             st.renaming = Some((id, l.name.clone()));
@@ -780,6 +810,16 @@ pub fn brush_editor(st: &mut State, ui: &mut egui::Ui) {
                 let mut sm = b.smoothing * 100.0;
                 slider(ui, "Estabilizador", &mut sm, 0.0..=100.0, "%");
                 b.smoothing = sm / 100.0;
+                ui.label(RichText::new("Spray").color(theme::TEXT_DIM));
+                ui.add(paw_ui::Slider::new(&mut b.spray, 0..=100).suffix(" partículas"));
+                ui.end_row();
+                if b.spray > 0 {
+                    ui.label(RichText::new("  tamanho").color(theme::TEXT_DIM));
+                    let mut ps = b.spray_size * 100.0;
+                    ui.add(paw_ui::Slider::new(&mut ps, 2.0..=100.0).suffix("%"));
+                    b.spray_size = ps / 100.0;
+                    ui.end_row();
+                }
                 ui.label("Ponta");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut b.tip, Tip::Round, "Redonda");
@@ -787,6 +827,54 @@ pub fn brush_editor(st: &mut State, ui: &mut egui::Ui) {
                 });
                 ui.end_row();
             });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Dinâmica").strong());
+            let d = &mut b.dynamics;
+            egui::Grid::new("brush-dynamics")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    use pawpaint_core::brush::Sensor;
+                    let combo = |ui: &mut egui::Ui, id: &str, name: &str, v: &mut Sensor| {
+                        ui.label(RichText::new(name).color(theme::TEXT_DIM));
+                        egui::ComboBox::from_id_salt(id)
+                            .width(ui.available_width().clamp(80.0, 200.0))
+                            .selected_text(v.label())
+                            .show_ui(ui, |ui| {
+                                for s in Sensor::ALL {
+                                    ui.selectable_value(v, s, s.label());
+                                }
+                            });
+                        ui.end_row();
+                    };
+                    combo(ui, "dyn-size", "Tamanho muda com", &mut d.size);
+                    if d.size != Sensor::None {
+                        ui.label(RichText::new("  no mínimo").color(theme::TEXT_DIM));
+                        let mut m = d.size_min * 100.0;
+                        ui.add(paw_ui::Slider::new(&mut m, 0.0..=100.0).suffix("%"));
+                        d.size_min = m / 100.0;
+                        ui.end_row();
+                    }
+                    combo(ui, "dyn-flow", "Fluxo muda com", &mut d.flow);
+                    if d.flow != Sensor::None {
+                        ui.label(RichText::new("  no mínimo").color(theme::TEXT_DIM));
+                        let mut m = d.flow_min * 100.0;
+                        ui.add(paw_ui::Slider::new(&mut m, 0.0..=100.0).suffix("%"));
+                        d.flow_min = m / 100.0;
+                        ui.end_row();
+                    }
+                    if d.size == Sensor::Fade || d.flow == Sensor::Fade {
+                        ui.label(RichText::new("Some em").color(theme::TEXT_DIM));
+                        ui.add(
+                            paw_ui::Slider::new(&mut d.fade_len, 20.0..=3000.0)
+                                .logarithmic(true)
+                                .suffix(" px"),
+                        );
+                        ui.end_row();
+                    }
+                    ui.label(RichText::new("Ângulo").color(theme::TEXT_DIM));
+                    ui.checkbox(&mut d.follow_stroke, "segue o traço");
+                    ui.end_row();
+                });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add(
@@ -815,6 +903,11 @@ pub fn tool_options(st: &mut State, ui: &mut egui::Ui) {
     let o = &mut st.opts;
     match tool {
         Tool::Brush | Tool::Eraser => {
+            label(ui, "Simetria radial");
+            let mut n = st.symmetry as i32;
+            ui.add(paw_ui::Slider::new(&mut n, 1..=16).text("repetições"));
+            st.symmetry = n as u32;
+            ui.add_space(4.0);
             label(ui, "Modo de mistura do pincel");
             egui::ComboBox::from_id_salt("brush-blend")
                 .selected_text(st.blend.label())
@@ -831,6 +924,19 @@ pub fn tool_options(st: &mut State, ui: &mut egui::Ui) {
         }
         Tool::Smudge => {
             ui.label(RichText::new("Arraste sobre a pintura para borrar. O fluxo do pincel controla a força; dureza e tamanho valem como no pincel.").weak().small());
+        }
+        Tool::Clone => {
+            ui.label(
+                RichText::new(
+                    "Alt+clique escolhe de onde copiar; depois pinte onde quiser. A cruz mostra o que está sendo copiado. Copia da camada ativa, com o tamanho, a dureza e o fluxo do pincel.",
+                )
+                .weak()
+                .small(),
+            );
+            if ui.button("Escolher outra origem").clicked() {
+                st.clone_source = None;
+                st.clone_offset = None;
+            }
         }
         Tool::Fill => {
             ui.add(paw_ui::Slider::new(&mut o.fill_tolerance, 0.0..=1.0).text("Tolerância"));
@@ -1249,3 +1355,170 @@ pub fn history(st: &mut State, ui: &mut egui::Ui) {
 
 #[allow(dead_code)]
 fn unused(_: Pos2) {}
+
+// ---------------------------------------------------------------- referência
+
+/// Painel Referência: uma imagem para olhar enquanto pinta. Clicar nela pega a cor.
+pub fn reference(st: &mut State, ui: &mut egui::Ui) {
+    if st.reference.is_none() {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Abra uma foto ou desenho para ter ao lado da tela (ela não entra no documento). Clique nela para pegar uma cor.")
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(6.0);
+        if ui.button("Abrir imagem de referência…").clicked() {
+            crate::app::ask_reference(st);
+        }
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    let mut change = false;
+    let mut remove = false;
+    let mut picked: Option<[u8; 3]> = None;
+    if let Some(r) = &mut st.reference {
+        if r.tex.is_none() {
+            let (w, h) = (r.img.width() as usize, r.img.height() as usize);
+            let color = egui::ColorImage::from_rgba_unmultiplied([w, h], r.img.as_raw());
+            r.tex = Some(ctx.load_texture("reference", color, egui::TextureOptions::LINEAR));
+        }
+        let avail = ui.available_size();
+        let (iw, ih) = (r.img.width() as f32, r.img.height() as f32);
+        let k = (avail.x / iw).min((avail.y - 22.0) / ih).max(0.01);
+        let (rect, resp) = ui.allocate_exact_size(vec2(iw * k, ih * k), Sense::click());
+        if let Some(t) = &r.tex {
+            ui.painter().image(
+                t.id(),
+                rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        if let Some(pos) = resp.hover_pos() {
+            let (x, y) = (
+                (((pos.x - rect.left()) / k) as u32).min(r.img.width() - 1),
+                (((pos.y - rect.top()) / k) as u32).min(r.img.height() - 1),
+            );
+            let p = r.img.get_pixel(x, y).0;
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            resp.clone()
+                .on_hover_text(format!("#{:02x}{:02x}{:02x}", p[0], p[1], p[2]));
+            if resp.clicked() {
+                picked = Some([p[0], p[1], p[2]]);
+            }
+        }
+        ui.label(RichText::new(&r.name).small().color(theme::TEXT_DIM));
+        resp.context_menu(|ui| {
+            if ui.button("Trocar a imagem…").clicked() {
+                ui.close();
+                change = true;
+            }
+            if ui.button("Tirar a referência").clicked() {
+                ui.close();
+                remove = true;
+            }
+        });
+    }
+    if let Some(c) = picked {
+        st.fg = c;
+        st.hsv = rgb_to_hsv(c);
+    }
+    if change {
+        crate::app::ask_reference(st);
+    }
+    if remove {
+        st.reference = None;
+    }
+}
+
+// ---------------------------------------------------------------- histograma
+
+/// Histograma da imagem final: vermelho, verde e azul sobrepostos (ou a luminosidade). Recalcula
+/// quando a imagem muda, no máximo a cada 400 ms e nunca no meio de um traço.
+pub fn histogram(st: &mut State, ui: &mut egui::Ui) {
+    let painting = st.interaction.is_some();
+    let Some(d) = st.doc_mut() else {
+        ui.label(RichText::new("Nenhum documento aberto").color(theme::TEXT_DIM));
+        return;
+    };
+    let rev = d.ed.pixel_rev();
+    let stale = d
+        .histogram
+        .as_ref()
+        .is_none_or(|(r, at, _)| *r != rev && at.elapsed().as_millis() > 400);
+    if stale && !painting {
+        // 1 pixel a cada N: fotos grandes ficam em ~1 milhão de amostras
+        let doc = d.ed.doc();
+        let step = ((doc.width * doc.height) as f32 / 1.0e6)
+            .sqrt()
+            .ceil()
+            .max(1.0) as usize;
+        let h = pawpaint_core::composite::histogram(doc, step);
+        d.histogram = Some((rev, std::time::Instant::now(), h));
+    } else if d.histogram.as_ref().is_some_and(|(r, ..)| *r != rev) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(450));
+    }
+    let Some((_, _, h)) = &d.histogram else {
+        return;
+    };
+    let mode = ui
+        .ctx()
+        .memory_mut(|m| *m.data.get_temp_mut_or(egui::Id::new("hist-mode"), 0u8));
+    let mut new_mode = mode;
+    ui.horizontal(|ui| {
+        for (i, name) in ["RGB", "Luz"].into_iter().enumerate() {
+            if ui.selectable_label(mode == i as u8, name).clicked() {
+                new_mode = i as u8;
+            }
+        }
+    });
+    if new_mode != mode {
+        ui.ctx()
+            .memory_mut(|m| m.data.insert_temp(egui::Id::new("hist-mode"), new_mode));
+    }
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(
+            ui.available_width(),
+            (ui.available_height() - 4.0).clamp(60.0, 160.0),
+        ),
+        Sense::hover(),
+    );
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 3.0, theme::BG_DARK);
+    // O 0 e o 255 costumam ter montanhas enormes (preto e branco puros): escala pelo 99º centil.
+    let series: Vec<([u32; 256], Color32)> = if mode == 0 {
+        vec![
+            (h.r, Color32::from_rgba_unmultiplied(235, 70, 70, 150)),
+            (h.g, Color32::from_rgba_unmultiplied(80, 210, 90, 150)),
+            (h.b, Color32::from_rgba_unmultiplied(80, 120, 245, 150)),
+        ]
+    } else {
+        vec![(h.luma, Color32::from_rgba_unmultiplied(220, 220, 225, 190))]
+    };
+    let mut all: Vec<u32> = series.iter().flat_map(|(s, _)| s.iter().copied()).collect();
+    all.sort_unstable();
+    let top = all[all.len() * 99 / 100].max(1) as f32;
+    for (data, color) in &series {
+        for (i, v) in data.iter().enumerate() {
+            let hgt = (*v as f32 / top).min(1.0) * (rect.height() - 4.0);
+            if hgt < 0.5 {
+                continue;
+            }
+            let x = rect.left() + rect.width() * i as f32 / 256.0;
+            p.rect_filled(
+                Rect::from_min_max(
+                    pos2(x, rect.bottom() - 2.0 - hgt),
+                    pos2(x + (rect.width() / 256.0).max(1.0), rect.bottom() - 2.0),
+                ),
+                0.0,
+                *color,
+            );
+        }
+    }
+    ui.label(
+        RichText::new(format!("{} pixels amostrados", h.counted))
+            .small()
+            .color(theme::TEXT_DIM),
+    );
+}

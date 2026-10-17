@@ -90,6 +90,8 @@ enum Dialog {
         path: Option<PathBuf>,
     },
     Syntax,
+    /// Análise do jeito de falar (muletas, repetições, frases longas, o gancho).
+    Insights(core::Insights),
 }
 
 enum Purpose {
@@ -831,6 +833,16 @@ impl WriteApp {
                     ui.ctx().copy_text(core::spoken(&self.text));
                     self.say("Fala copiada");
                 }
+                if item(ui, "Copiar capítulos do YouTube", "", has) {
+                    ui.close();
+                    match core::youtube_chapters(&self.text, self.settings.wpm) {
+                        Ok(chapters) => {
+                            ui.ctx().copy_text(chapters);
+                            self.say("Capítulos copiados: cole na descrição do vídeo");
+                        }
+                        Err(why) => self.warn(why),
+                    }
+                }
                 ui.separator();
                 if item(ui, "Sair", "", true) {
                     ui.close();
@@ -860,6 +872,18 @@ impl WriteApp {
                     ui.close();
                     self.settings.outline = !self.settings.outline;
                     self.save_settings();
+                }
+                if item(
+                    ui,
+                    "Análise do texto (muletas, repetições, gancho)…",
+                    "",
+                    true,
+                ) {
+                    ui.close();
+                    self.dialog = Some(Dialog::Insights(core::insights(
+                        &self.text,
+                        self.settings.wpm,
+                    )));
                 }
                 ui.separator();
                 for (label, keys, delta) in [
@@ -1202,10 +1226,11 @@ impl WriteApp {
             Dialog::Unsaved(_) | Dialog::UnsavedDrop(_) => "Mudanças não salvas",
             Dialog::Recover { .. } => "Recuperação automática",
             Dialog::Syntax => "Como escrever o roteiro",
+            Dialog::Insights(_) => "Análise do texto",
         };
         let mut keep = true;
         let mut action: Option<Action> = None;
-        let blocking = !matches!(dialog, Dialog::Syntax);
+        let blocking = !matches!(dialog, Dialog::Syntax | Dialog::Insights(_));
         let body = |ui: &mut egui::Ui| match &dialog {
             Dialog::Unsaved(then) => {
                 let then = *then;
@@ -1272,6 +1297,60 @@ impl WriteApp {
                     if ui.button("Descartar").clicked() {
                         keep = false;
                         action = Some(Box::new(|me| me.clear_autosave()));
+                    }
+                });
+            }
+            Dialog::Insights(i) => {
+                let dim = |t: &str| RichText::new(t.to_string()).color(theme::TEXT_DIM);
+                ui.label(RichText::new("Gancho (primeiros 30 s)").strong());
+                if i.hook.is_empty() {
+                    ui.label(dim("Ainda não há fala."));
+                } else {
+                    ui.label(dim(&format!("{} palavras:", i.hook_words)));
+                    ui.label(RichText::new(&i.hook).italics());
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Muletas").strong());
+                if i.fillers.is_empty() {
+                    ui.label(dim("Nenhuma se repete 3 vezes ou mais."));
+                } else {
+                    ui.label(
+                        i.fillers
+                            .iter()
+                            .map(|(w, n)| format!("{w} ×{n}"))
+                            .collect::<Vec<_>>()
+                            .join("   "),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Palavras que mais se repetem").strong());
+                if i.repeated.is_empty() {
+                    ui.label(dim("Nenhuma passa de 3 repetições."));
+                } else {
+                    ui.label(
+                        i.repeated
+                            .iter()
+                            .map(|(w, n)| format!("{w} ×{n}"))
+                            .collect::<Vec<_>>()
+                            .join("   "),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Frases longas (mais de 30 palavras)").strong());
+                if i.long_sentences.is_empty() {
+                    ui.label(dim("Nenhuma."));
+                }
+                for (head, n) in &i.long_sentences {
+                    ui.label(format!("{head}  ({n} palavras)"));
+                }
+                ui.add_space(6.0);
+                ui.label(dim(&format!(
+                    "Média de {:.0} palavras por frase.",
+                    i.avg_sentence
+                )));
+                paw_ui::theme::dialog_actions(ui, |ui| {
+                    if paw_ui::theme::primary_button(ui, "Fechar").clicked() {
+                        keep = false;
                     }
                 });
             }
@@ -1474,6 +1553,46 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Um\nolá mundo");
         let b = backups::backups_dir_in(&app.data.join("backups"), &path);
         assert_eq!(backups::list_backups(&b).len(), 1);
+    }
+
+    #[test]
+    fn insights_dialog_opens_draws_and_closes_with_escape() {
+        let mut app = WriteApp::empty(Settings::default());
+        app.data = tempfile::tempdir().unwrap().keep();
+        app.text =
+            "Então tipo, né. Então tipo cara. Então tipo assim.\nCâmera câmera câmera câmera."
+                .into();
+        app.dialog = Some(Dialog::Insights(core::insights(&app.text, 150.0)));
+        let ctx = egui::Context::default();
+        let frame = |app: &mut WriteApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| app.frame(ui))
+                .drop_without_applying_deltas();
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Insights(_))),
+            "continua aberto"
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: Some(egui::Key::Escape),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.dialog.is_none(), "Esc fecha");
     }
 
     #[test]

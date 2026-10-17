@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 pawcut-core.workspace = true
 paw-media.workspace = true
+paw-audio.workspace = true
 image.workspace = true
 rayon.workspace = true
 cosmic-text.workspace = true

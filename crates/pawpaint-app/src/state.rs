@@ -26,10 +26,14 @@ pub enum Panel {
     Palette,
     Overview,
     History,
+    /// Imagem de referência para olhar (e pegar cores), fora do documento.
+    Reference,
+    /// Histograma da imagem final.
+    Histogram,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 10] = [
+    pub const ALL: [Panel; 12] = [
         Panel::Canvas,
         Panel::Toolbox,
         Panel::Layers,
@@ -40,6 +44,8 @@ impl Panel {
         Panel::Palette,
         Panel::Overview,
         Panel::History,
+        Panel::Reference,
+        Panel::Histogram,
     ];
 
     pub fn title(self) -> &'static str {
@@ -54,6 +60,8 @@ impl Panel {
             Panel::Palette => "Paleta",
             Panel::Overview => "Visão geral",
             Panel::History => "Histórico",
+            Panel::Reference => "Referência",
+            Panel::Histogram => "Histograma",
         }
     }
 }
@@ -63,6 +71,8 @@ pub enum Tool {
     Brush,
     Eraser,
     Smudge,
+    /// Carimbo de clone: Alt+clique escolhe a origem, pintar copia dela.
+    Clone,
     Fill,
     Gradient,
     Picker,
@@ -80,10 +90,11 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 17] = [
+    pub const ALL: [Tool; 18] = [
         Tool::Brush,
         Tool::Eraser,
         Tool::Smudge,
+        Tool::Clone,
         Tool::Fill,
         Tool::Gradient,
         Tool::Picker,
@@ -107,6 +118,7 @@ impl Tool {
             Tool::Brush => Icon::Brush,
             Tool::Eraser => Icon::Eraser,
             Tool::Smudge => Icon::Smudge,
+            Tool::Clone => Icon::Clone,
             Tool::Fill => Icon::Bucket,
             Tool::Gradient => Icon::Gradient,
             Tool::Picker => Icon::Eyedropper,
@@ -131,6 +143,7 @@ impl Tool {
             Tool::Brush
             | Tool::Eraser
             | Tool::Smudge
+            | Tool::Clone
             | Tool::Fill
             | Tool::Gradient
             | Tool::Picker => 0,
@@ -145,6 +158,7 @@ impl Tool {
             Tool::Brush => "Pincel",
             Tool::Eraser => "Borracha",
             Tool::Smudge => "Borrão (arrasta a cor)",
+            Tool::Clone => "Carimbo de clone (Alt+clique escolhe a origem)",
             Tool::Fill => "Balde de tinta",
             Tool::Gradient => "Degradê",
             Tool::Picker => "Conta-gotas",
@@ -167,6 +181,7 @@ impl Tool {
             Tool::Brush => "B",
             Tool::Eraser => "E",
             Tool::Smudge => "S",
+            Tool::Clone => "H",
             Tool::Fill => "F",
             Tool::Gradient => "G",
             Tool::Picker => "P",
@@ -187,7 +202,13 @@ impl Tool {
     pub fn paints(self) -> bool {
         matches!(
             self,
-            Tool::Brush | Tool::Eraser | Tool::Smudge | Tool::Line | Tool::Rect | Tool::Ellipse
+            Tool::Brush
+                | Tool::Eraser
+                | Tool::Smudge
+                | Tool::Clone
+                | Tool::Line
+                | Tool::Rect
+                | Tool::Ellipse
         )
     }
 }
@@ -274,6 +295,19 @@ pub struct DocView {
     pub cursor: Option<(f32, f32)>,
     /// Canto de cima à esquerda da imagem na janela (último quadro).
     pub view_origin: egui::Pos2,
+    /// Rotação da visão em graus (só muda como a imagem aparece, não a imagem).
+    pub view_rot: f32,
+    /// Centro da imagem na janela (último quadro): em volta dele a visão gira.
+    pub view_center: egui::Pos2,
+    /// Visão espelhada na horizontal.
+    pub view_flip: bool,
+    /// Histograma em cache: revisão dos pixels em que foi calculado, quando, e o resultado.
+    pub histogram: Option<(u64, std::time::Instant, pawpaint_core::composite::Histogram)>,
+    /// Onde o último traço de pincel terminou: Shift+clique traça uma reta a partir daqui.
+    pub last_stroke_end: Option<(f32, f32)>,
+    /// Régua de desenho (duas pontas, em pixels da imagem): traços que começam perto dela
+    /// ficam presos à reta.
+    pub ruler: Option<[(f32, f32); 2]>,
     /// Tamanho da área do canvas na janela (último quadro): a Visão geral desenha com ele o
     /// retângulo do que está aparecendo.
     pub canvas_size: Vec2,
@@ -302,6 +336,12 @@ impl DocView {
             crop: None,
             cursor: None,
             view_origin: egui::Pos2::ZERO,
+            view_rot: 0.0,
+            view_center: egui::Pos2::ZERO,
+            view_flip: false,
+            histogram: None,
+            last_stroke_end: None,
+            ruler: None,
             canvas_size: Vec2::ZERO,
             name: "Sem título".to_string(),
             edit_mask: false,
@@ -326,6 +366,7 @@ pub enum Purpose {
     ImportLayer,
     Export,
     ExportJpg,
+    Reference,
 }
 
 #[derive(Clone)]
@@ -384,6 +425,13 @@ pub enum Dialog {
     Recover(Vec<PathBuf>),
 }
 
+/// A imagem do painel Referência.
+pub struct Reference {
+    pub name: String,
+    pub img: image::RgbaImage,
+    pub tex: Option<TextureHandle>,
+}
+
 /// O que o mouse está fazendo na tela, entre apertar e soltar.
 pub enum Interaction {
     Stroke,
@@ -409,7 +457,21 @@ pub enum Interaction {
         start: (f32, f32),
     },
     Pan,
+    /// Girando a visão: ângulo (graus) do cursor em volta do centro no quadro anterior.
+    RotateView {
+        last: f32,
+    },
     Picker,
+    /// Alt + arrastar na horizontal muda o tamanho do pincel (o círculo cresce em volta do ponto).
+    BrushSize {
+        origin: egui::Pos2,
+        start: f32,
+    },
+    /// Arrastando para definir a régua.
+    Ruler {
+        start: (f32, f32),
+        cur: (f32, f32),
+    },
     FloatMove {
         grab: (f32, f32),
         orig: (f32, f32),
@@ -445,6 +507,14 @@ pub struct State {
     pub blend: BlendMode,
     /// Pintura com espelho: (eixo vertical no meio, eixo horizontal no meio).
     pub mirror: (bool, bool),
+    /// Modo de repetição (mosaico), como o Shift+W do Krita.
+    pub wrap: bool,
+    /// Simetria radial (repetições em volta do centro); 1 = desligada.
+    pub symmetry: u32,
+    /// Próximo arrasto na imagem define a régua.
+    pub placing_ruler: bool,
+    /// O traço em andamento está preso à régua.
+    pub ruler_lock: bool,
     pub opts: ToolOpts,
     pub clipboard: Option<Clip>,
     pub toasts: Toasts,
@@ -463,6 +533,18 @@ pub struct State {
     /// A ferramenta acabou de mudar (o Transformar já solta a camada).
     pub tool_changed: bool,
     pub last_autosave: std::time::Instant,
+    /// Pressão da caneta (0..1) enquanto ela toca a tela; `None` com mouse.
+    pub pen: Option<f32>,
+    /// Origem do carimbo de clone (Alt+clique) e o deslocamento fixado no primeiro traço depois
+    /// dela (alinhado: os traços seguintes continuam copiando do mesmo jeito).
+    pub clone_source: Option<(f32, f32)>,
+    pub clone_offset: Option<(f32, f32)>,
+    /// Imagem de referência (o painel Referência): a imagem e, depois de desenhada pela primeira
+    /// vez, a textura dela.
+    pub reference: Option<Reference>,
+    /// Camada de ajuste recém-criada cujo diálogo está aberto: guarda a camada que estava ativa
+    /// antes, para o Cancelar desfazer a criação por completo.
+    pub new_adjust: Option<LayerId>,
     /// Autosave em andamento: roda fora da thread da interface, com uma cópia do documento.
     pub autosave_job: Option<std::thread::JoinHandle<()>>,
     /// Documentos já fechados: um autosave atrasado não pode recriar o arquivo deles.

@@ -145,6 +145,57 @@ fn fit_fill_scales(p: &Project, clip: &Clip) -> Option<(f32, f32)> {
     Some(((pw / bw).min(ph / bh), (pw / bw).max(ph / bh)))
 }
 
+/// Preenche o quadro com o clipe e desliza do foco `a` ao foco `b` (−1 borda esquerda da
+/// imagem, 1 borda direita) durante o clipe, com keyframes de posição X.
+pub(crate) fn pan_clip(st: &mut crate::state::AppState, p: &Project, clip: &Clip, a: f32, b: f32) {
+    let Some((_, cover)) = fit_fill_scales(p, clip) else {
+        return;
+    };
+    let ClipSource::Media(m) = &clip.source else {
+        return;
+    };
+    let Some(m) = p.media(*m) else { return };
+    let (pw, ph) = (p.settings.width as f32, p.settings.height as f32);
+    let (w, h) = (m.info.width.max(1) as f32, m.info.height.max(1) as f32);
+    let base = (pw / w).min(ph / h);
+    // largura do clipe já com o zoom de "preencher" e quanto ela passa do quadro
+    let overflow = ((w * base * cover - pw) / 2.0).max(0.0);
+    let id = clip.id;
+    st.apply_coalescing(
+        Edit::SetClip {
+            clip: id,
+            change: ClipChange::Transform(Transform {
+                x: -a.clamp(-1.0, 1.0) * overflow,
+                y: 0.0,
+                scale: cover,
+                ..clip.transform
+            }),
+        },
+        "pan",
+    );
+    st.apply_coalescing(
+        Edit::ClearKeyframes {
+            clip: id,
+            param: Param::X,
+        },
+        "pan",
+    );
+    if (a - b).abs() > 1e-3 && overflow > 0.0 {
+        let end = clip.source_start + clip.duration as f64 * clip.speed;
+        for (at, focus) in [(clip.source_start, a), (end - clip.speed, b)] {
+            st.apply_coalescing(
+                Edit::SetKeyframe {
+                    clip: id,
+                    param: Param::X,
+                    at,
+                    value: Some(-focus.clamp(-1.0, 1.0) * overflow),
+                },
+                "pan",
+            );
+        }
+    }
+}
+
 /// Quanto o valor muda por pixel arrastado, na unidade mostrada (% , px, °, dB). O valor
 /// antigo multiplicava pelo fator de escala, e Zoom/Opacidade (em %) saltavam 50 % por pixel.
 fn drag_speed(param: Param) -> f64 {
@@ -425,6 +476,263 @@ impl Workspace {
                 self.st.apply_coalescing(e, key);
             }
         }
+    }
+
+    /// Efeitos de áudio do clipe: cada um liga e desliga e mostra os próprios valores. Os efeitos
+    /// rodam no áudio inteiro do clipe e ficam guardados com ele.
+    fn audio_fx_section(&mut self, ui: &mut egui::Ui, aclips: &[Clip]) {
+        use pawcut_core::AudioFx as Fx;
+        let Some(first) = aclips.first() else { return };
+        let before = first.audio_fx.clone();
+        let mut list = before.clone();
+        section(ui, "Efeitos de áudio", |ui| {
+            row(
+                ui,
+                "Preset",
+                |ui| {
+                    if ui
+                        .button("Limpar voz")
+                        .on_hover_text(
+                            "Tira o ronco, abaixa o chiado nas pausas, tira o chiado dos S e nivela o volume",
+                        )
+                        .clicked()
+                    {
+                        list = voice_cleanup();
+                    }
+                },
+                |_| {},
+            );
+            row(
+                ui,
+                "",
+                |ui| {
+                    if ui
+                        .add_enabled_ui(!list.is_empty(), |ui| {
+                            paw_ui::icons::button(
+                                ui,
+                                paw_ui::icons::Icon::Trash,
+                                14.0,
+                                false,
+                                "Tirar todos os efeitos de áudio do clipe",
+                            )
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        list.clear();
+                    }
+                },
+                |_| {},
+            );
+            for kind in FX_ORDER {
+                let at = list.iter().position(|f| fx_kind(f) == kind);
+                let mut on = at.is_some();
+                row(
+                    ui,
+                    fx_label(kind),
+                    |ui| {
+                        ui.checkbox(&mut on, "");
+                    },
+                    |_| {},
+                );
+                match (on, at) {
+                    (true, None) => {
+                        list.push(fx_default(kind));
+                        list.sort_by_key(fx_kind);
+                    }
+                    (false, Some(i)) => {
+                        list.remove(i);
+                    }
+                    _ => {}
+                }
+                let Some(i) = list.iter().position(|f| fx_kind(f) == kind) else {
+                    continue;
+                };
+                let drag = |ui: &mut egui::Ui,
+                            v: &mut f32,
+                            r: std::ops::RangeInclusive<f32>,
+                            sp: f64,
+                            suffix: &str| {
+                    ui.add(
+                        DragValue::new(v)
+                            .range(r)
+                            .speed(sp)
+                            .max_decimals(1)
+                            .suffix(suffix),
+                    );
+                };
+                match &mut list[i] {
+                    Fx::HighPass { hz } => row(
+                        ui,
+                        "  corta abaixo de",
+                        |ui| drag(ui, hz, 20.0..=400.0, 1.0, " Hz"),
+                        |_| {},
+                    ),
+                    Fx::NoiseGate {
+                        threshold_db,
+                        reduction_db,
+                    } => {
+                        row(
+                            ui,
+                            "  abaixo de",
+                            |ui| drag(ui, threshold_db, -80.0..=0.0, 0.5, " dB"),
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "  abaixa",
+                            |ui| drag(ui, reduction_db, 0.0..=60.0, 0.5, " dB"),
+                            |_| {},
+                        );
+                    }
+                    Fx::Compressor {
+                        threshold_db,
+                        ratio,
+                        makeup_db,
+                        ..
+                    } => {
+                        row(
+                            ui,
+                            "  limiar",
+                            |ui| drag(ui, threshold_db, -60.0..=0.0, 0.5, " dB"),
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "  razão",
+                            |ui| drag(ui, ratio, 1.0..=20.0, 0.1, " :1"),
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "  ganho",
+                            |ui| drag(ui, makeup_db, 0.0..=24.0, 0.2, " dB"),
+                            |_| {},
+                        );
+                    }
+                    Fx::DeEss {
+                        threshold_db,
+                        reduction_db,
+                    } => {
+                        row(
+                            ui,
+                            "  limiar",
+                            |ui| drag(ui, threshold_db, -60.0..=0.0, 0.5, " dB"),
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "  abaixa",
+                            |ui| drag(ui, reduction_db, 0.0..=24.0, 0.5, " dB"),
+                            |_| {},
+                        );
+                    }
+                    Fx::Eq3 {
+                        bass_db,
+                        mid_db,
+                        treble_db,
+                    } => {
+                        row(
+                            ui,
+                            "  graves",
+                            |ui| drag(ui, bass_db, -18.0..=18.0, 0.2, " dB"),
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "  médios",
+                            |ui| drag(ui, mid_db, -18.0..=18.0, 0.2, " dB"),
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "  agudos",
+                            |ui| drag(ui, treble_db, -18.0..=18.0, 0.2, " dB"),
+                            |_| {},
+                        );
+                    }
+                    Fx::Notch { hz } => row(
+                        ui,
+                        "  frequência",
+                        |ui| drag(ui, hz, 20.0..=12000.0, 1.0, " Hz"),
+                        |_| {},
+                    ),
+                    Fx::Reverb { room, wet_db } => {
+                        row(
+                            ui,
+                            "  sala",
+                            |ui| drag(ui, room, 0.0..=1.0, 0.01, ""),
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "  quantidade",
+                            |ui| drag(ui, wet_db, -40.0..=0.0, 0.5, " dB"),
+                            |_| {},
+                        );
+                    }
+                }
+            }
+        });
+        if list != before {
+            self.apply_all(aclips, "audio-fx", |c| {
+                Some(Edit::SetClip {
+                    clip: c.id,
+                    change: ClipChange::AudioFx(list.clone()),
+                })
+            });
+            // um arraste de valor é um passo só; o próximo gesto abre outro
+            if ui.input(|i| !i.pointer.any_down()) {
+                self.st.editor.end_coalescing();
+            }
+        }
+    }
+
+    /// Estabilizar a imagem tremida (câmera na mão).
+    fn stabilize_section(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Estabilizar", |ui| {
+            let running = self
+                .stabilizing
+                .as_ref()
+                .map(|s| s.progress.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0);
+            row(
+                ui,
+                "Suavidade",
+                |ui| {
+                    ui.add_enabled(
+                        running.is_none(),
+                        DragValue::new(&mut self.stabilize_secs)
+                            .range(0.1..=3.0)
+                            .speed(0.02)
+                            .max_decimals(1)
+                            .suffix(" s"),
+                    )
+                    .on_hover_text("Quanto da tremida entra no cálculo: maior = câmera mais firme, mas segue menos os movimentos de verdade");
+                },
+                |_| {},
+            );
+            row(
+                ui,
+                "",
+                |ui| {
+                    match running {
+                    Some(f) => {
+                        ui.add(egui::ProgressBar::new(f).desired_width(ui.available_width()));
+                    }
+                    None => {
+                        if ui
+                            .button("Estabilizar")
+                            .on_hover_text("Mede a tremida e põe keyframes de posição com um pouco de zoom para esconder as bordas")
+                            .clicked()
+                        {
+                            self.start_stabilization();
+                        }
+                    }
+                }
+                },
+                |_| {},
+            );
+        });
     }
 
     /// Chroma key (fundo verde/azul): liga, escolhe a cor e ajusta.
@@ -720,6 +1028,52 @@ impl Workspace {
                                 |_| {},
                             );
                         }
+                        if fit_fill_scales(&project, &first).is_some() {
+                            for (label, tip, second) in [
+                                ("Panorâmica de", "Onde a imagem está no começo do clipe", false),
+                                ("até", "Onde a imagem está no fim do clipe", true),
+                            ] {
+                                let v = if second {
+                                    &mut self.pan_focus.1
+                                } else {
+                                    &mut self.pan_focus.0
+                                };
+                                row(
+                                    ui,
+                                    label,
+                                    |ui| {
+                                        ui.add(
+                                            DragValue::new(v)
+                                                .range(-100.0..=100.0)
+                                                .speed(0.5)
+                                                .suffix(" %"),
+                                        )
+                                        .on_hover_text(tip);
+                                    },
+                                    |_| {},
+                                );
+                            }
+                            row(
+                                ui,
+                                "",
+                                |ui| {
+                                    if ui
+                                        .button("Aplicar panorâmica")
+                                        .on_hover_text(
+                                            "Preenche o quadro e desliza de um lado ao outro durante o clipe (bom para vertical 9:16)",
+                                        )
+                                        .clicked()
+                                    {
+                                        let (a, b) = self.pan_focus;
+                                        for c in &clips {
+                                            pan_clip(&mut self.st, &project, c, a / 100.0, b / 100.0);
+                                        }
+                                        self.st.editor.end_coalescing();
+                                    }
+                                },
+                                |_| {},
+                            );
+                        }
                         if matches!(first.source, ClipSource::Media(_)) {
                             let mut on = first.blur_fill;
                             row(
@@ -848,7 +1202,14 @@ impl Workspace {
                             "",
                         );
                         if first.color != ColorAdjust::default()
-                            && ui.small_button("Resetar cor").clicked()
+                            && paw_ui::icons::button(
+                                ui,
+                                paw_ui::icons::Icon::Reset,
+                                14.0,
+                                false,
+                                "Resetar a cor do clipe",
+                            )
+                            .clicked()
                         {
                             self.apply_all(&clips, "insp-color-reset", |c| {
                                 Some(Edit::SetClip {
@@ -860,6 +1221,7 @@ impl Workspace {
                     });
                     if matches!(first.source, ClipSource::Media(_)) {
                         self.chroma_section(ui, &clips, &first);
+                        self.stabilize_section(ui);
                     }
                 }
                 if tab == InspectorTab::Time {
@@ -965,6 +1327,46 @@ impl Workspace {
                                     "insp-speed",
                                 );
                             }
+                        }
+                        if !still {
+                            for (label, second) in [("Rampa de", false), ("até", true)] {
+                                let v = if second {
+                                    &mut self.ramp.1
+                                } else {
+                                    &mut self.ramp.0
+                                };
+                                row(
+                                    ui,
+                                    label,
+                                    |ui| {
+                                        ui.add(
+                                            DragValue::new(v)
+                                                .range(0.1..=10.0)
+                                                .speed(0.02)
+                                                .max_decimals(2)
+                                                .suffix(" ×"),
+                                        );
+                                    },
+                                    |_| {},
+                                );
+                            }
+                            row(
+                                ui,
+                                "",
+                                |ui| {
+                                    if ui
+                                        .button("Aplicar rampa")
+                                        .on_hover_text(
+                                            "Divide o clipe em pedaços cuja velocidade vai de um valor ao outro (acelera ou freia aos poucos). O resto da faixa acompanha.",
+                                        )
+                                        .clicked()
+                                    {
+                                        let (a, b) = self.ramp;
+                                        self.st.speed_ramp(a, b, 8);
+                                    }
+                                },
+                                |_| {},
+                            );
                         }
                         for (label, value, is_in) in [
                             ("Fade in", first.fade_in, true),
@@ -1082,6 +1484,7 @@ impl Workspace {
                     });
                 }
                 if tab == InspectorTab::Audio && !aclips.is_empty() {
+                    self.audio_fx_section(ui, &aclips);
                     section(ui, "Áudio", |ui| {
                         self.param_row(
                             ui,
@@ -1182,7 +1585,143 @@ impl Workspace {
                             |_| {},
                         );
                     });
+                    section(ui, "Música abaixa na voz", |ui| {
+                        row(
+                            ui,
+                            "Voz acima de",
+                            |ui| {
+                                ui.add(
+                                    DragValue::new(&mut self.duck_threshold)
+                                        .range(-60.0..=-10.0)
+                                        .suffix(" dB"),
+                                );
+                            },
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "Música abaixa",
+                            |ui| {
+                                ui.add(
+                                    DragValue::new(&mut self.duck_db)
+                                        .range(3.0..=40.0)
+                                        .suffix(" dB"),
+                                );
+                            },
+                            |_| {},
+                        );
+                        row(
+                            ui,
+                            "",
+                            |ui| {
+                                if ui
+                                    .button("Abaixar a música")
+                                    .on_hover_text(
+                                        "Este clipe (a música) abaixa quando os outros clipes de áudio (a voz) falam. Vira keyframes de volume que você pode ajustar.",
+                                    )
+                                    .clicked()
+                                {
+                                    let (t, d) = (self.duck_threshold, self.duck_db);
+                                    self.st.auto_duck(t, d);
+                                }
+                            },
+                            |_| {},
+                        );
+                    });
                 }
+                section(ui, "Presets de aparência", |ui| {
+                    if self.presets.is_empty() {
+                        row(
+                            ui,
+                            "",
+                            |ui| {
+                                ui.label(
+                                    RichText::new("Nenhum preset. Salve a aparência deste clipe (cor, volume, chroma, fundo desfocado) para usar em outros.")
+                                        .weak()
+                                        .small(),
+                                );
+                            },
+                            |_| {},
+                        );
+                    } else {
+                        let names: Vec<String> =
+                            self.presets.iter().map(|p| p.name.clone()).collect();
+                        let sel = self.preset_pick.min(names.len() - 1);
+                        let mut pick = sel;
+                        row(
+                            ui,
+                            "Preset",
+                            |ui| {
+                                egui::ComboBox::from_id_salt("preset-pick")
+                                    .width(theme::fit_width(ui, 150.0))
+                                    .selected_text(&names[sel])
+                                    .show_ui(ui, |ui| {
+                                        for (i, n) in names.iter().enumerate() {
+                                            ui.selectable_value(&mut pick, i, n);
+                                        }
+                                    });
+                            },
+                            |_| {},
+                        );
+                        self.preset_pick = pick;
+                        row(
+                            ui,
+                            "",
+                            |ui| {
+                                if paw_ui::icons::button(
+                                    ui,
+                                    paw_ui::icons::Icon::Check,
+                                    14.0,
+                                    false,
+                                    "Aplicar: põe esta aparência nos clipes selecionados",
+                                )
+                                .clicked()
+                                {
+                                    self.apply_preset(pick);
+                                }
+                                if paw_ui::icons::button(
+                                    ui,
+                                    paw_ui::icons::Icon::Trash,
+                                    14.0,
+                                    false,
+                                    "Apagar este preset",
+                                )
+                                .clicked()
+                                {
+                                    self.delete_preset(pick);
+                                }
+                            },
+                            |_| {},
+                        );
+                    }
+                    row(
+                        ui,
+                        "Salvar como",
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.preset_name)
+                                    .desired_width(ui.available_width())
+                                    .hint_text("nome"),
+                            );
+                        },
+                        |_| {},
+                    );
+                    row(
+                        ui,
+                        "",
+                        |ui| {
+                            if ui
+                                .button("Salvar preset")
+                                .on_hover_text("Guarda a aparência deste clipe")
+                                .clicked()
+                            {
+                                let name = self.preset_name.clone();
+                                self.save_preset(&name, &first);
+                            }
+                        },
+                        |_| {},
+                    );
+                });
                 if first.link.is_some() {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -1342,5 +1881,135 @@ impl Workspace {
                 &format!("insp-{id:?}-text"),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pan_tests {
+    use super::*;
+    use crate::state::AppState;
+    use pawcut_core::*;
+
+    #[test]
+    fn pan_clip_fills_the_vertical_frame_and_slides_across_the_width() {
+        let mut st = AppState::new(Project::new(ProjectSettings::default()));
+        let media = st
+            .apply(Edit::AddMedia(MediaInfo {
+                path: "/videos/a.mp4".into(),
+                kind: MediaKind::Video { has_audio: false },
+                duration: Some(300),
+                width: 1920,
+                height: 1080,
+            }))
+            .unwrap()
+            .media
+            .unwrap();
+        st.apply(Edit::SetResolution {
+            width: 1080,
+            height: 1920,
+        })
+        .unwrap();
+        st.drop_media(media, TrackKind::Video, 0, 0);
+        let p = st.project().clone();
+        let clip = p.video_tracks[0].clips[0].clone();
+        pan_clip(&mut st, &p, &clip, -1.0, 1.0);
+        let c = st.project().clip(clip.id).unwrap().clone();
+        let (_, cover) = fit_fill_scales(&p, &clip).unwrap();
+        assert!((c.transform.scale - cover).abs() < 1e-4);
+        // 1920x1080 cobrindo 1080x1920: a imagem tem ~3413 px de largura, sobram ~1166 px de cada lado
+        let first = c.param(Param::X, 0);
+        let last = c.param(Param::X, c.duration - 1);
+        assert!(first > 1000.0 && last < -1000.0, "{first} → {last}");
+        assert!((first + last).abs() < 1.0, "simétrico");
+        // foco igual no começo e no fim: fica parado, sem keyframes
+        pan_clip(&mut st, &p, &clip, 0.5, 0.5);
+        let c = st.project().clip(clip.id).unwrap();
+        assert!(c.keyframes.get(&Param::X).is_none_or(|k| k.is_empty()));
+        assert!(c.transform.x < -500.0);
+    }
+}
+
+/// A ordem fixa dos efeitos na lista e na tela.
+const FX_ORDER: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
+
+fn fx_kind(f: &pawcut_core::AudioFx) -> u8 {
+    use pawcut_core::AudioFx as Fx;
+    match f {
+        Fx::HighPass { .. } => 0,
+        Fx::NoiseGate { .. } => 1,
+        Fx::Notch { .. } => 2,
+        Fx::DeEss { .. } => 3,
+        Fx::Eq3 { .. } => 4,
+        Fx::Compressor { .. } => 5,
+        Fx::Reverb { .. } => 6,
+    }
+}
+
+fn fx_label(kind: u8) -> &'static str {
+    [
+        "Filtro de graves",
+        "Noise gate",
+        "Notch",
+        "De-esser",
+        "Equalizador",
+        "Compressor",
+        "Reverb",
+    ][kind as usize]
+}
+
+fn fx_default(kind: u8) -> pawcut_core::AudioFx {
+    use pawcut_core::AudioFx as Fx;
+    match kind {
+        0 => Fx::HighPass { hz: 80.0 },
+        1 => Fx::NoiseGate {
+            threshold_db: -45.0,
+            reduction_db: 15.0,
+        },
+        2 => Fx::Notch { hz: 60.0 },
+        3 => Fx::DeEss {
+            threshold_db: -32.0,
+            reduction_db: 8.0,
+        },
+        4 => Fx::Eq3 {
+            bass_db: 0.0,
+            mid_db: 0.0,
+            treble_db: 0.0,
+        },
+        5 => Fx::Compressor {
+            threshold_db: -22.0,
+            ratio: 3.0,
+            attack_ms: 5.0,
+            release_ms: 100.0,
+            makeup_db: 3.0,
+        },
+        _ => Fx::Reverb {
+            room: 0.4,
+            wet_db: -18.0,
+        },
+    }
+}
+
+/// O preset "Limpar voz": o que o "Melhorar voz" do PawVoice faz, como efeitos do clipe.
+pub(crate) fn voice_cleanup() -> Vec<pawcut_core::AudioFx> {
+    [0u8, 1, 3, 5].into_iter().map(fx_default).collect()
+}
+
+#[cfg(test)]
+mod fx_tests {
+    use super::*;
+
+    #[test]
+    fn every_default_effect_is_valid_and_ordered() {
+        for k in FX_ORDER {
+            let f = fx_default(k);
+            assert!(f.is_valid(), "{}", fx_label(k));
+            assert_eq!(fx_kind(&f), k);
+        }
+        let list = voice_cleanup();
+        assert_eq!(list.len(), 4);
+        assert!(
+            list.windows(2).all(|w| fx_kind(&w[0]) < fx_kind(&w[1])),
+            "em ordem"
+        );
     }
 }

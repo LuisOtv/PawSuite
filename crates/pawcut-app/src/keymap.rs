@@ -55,6 +55,8 @@ pub enum Action {
     AddDissolve,
     ExtractInOut,
     LiftInOut,
+    AlignAudio,
+    Transcribe,
     NudgeLeft,
     NudgeRight,
     NudgeLeft10,
@@ -149,7 +151,7 @@ impl Action {
         })
     }
 
-    pub const ALL: [Action; 62] = [
+    pub const ALL: [Action; 64] = [
         Action::PlayPause,
         Action::PlayForward,
         Action::Stop,
@@ -197,6 +199,8 @@ impl Action {
         Action::AddDissolve,
         Action::ExtractInOut,
         Action::LiftInOut,
+        Action::AlignAudio,
+        Action::Transcribe,
         Action::NudgeLeft,
         Action::NudgeRight,
         Action::NudgeLeft10,
@@ -262,6 +266,8 @@ impl Action {
             Action::NextMarker => "Próximo marcador",
             Action::AddDissolve => "Cross dissolve no corte",
             Action::ExtractInOut => "Extrair In/Out (apaga e fecha)",
+            Action::AlignAudio => "Alinhar clipes pelo áudio",
+            Action::Transcribe => "Transcrever o áudio em legendas",
             Action::LiftInOut => "Levantar In/Out (apaga e deixa o buraco)",
             Action::NudgeLeft => "Empurrar clipe 1 frame para trás",
             Action::NudgeRight => "Empurrar clipe 1 frame para frente",
@@ -461,6 +467,8 @@ impl Keymap {
             (A::NextMarker, vec![K::shift(Key::ArrowDown)]),
             (A::AddDissolve, vec![K::ctrl(Key::T)]),
             (A::ExtractInOut, vec![K::shift(Key::X)]),
+            (A::AlignAudio, vec![K::ctrl_shift(Key::J)]),
+            (A::Transcribe, vec![K::ctrl_shift(Key::T)]),
             (A::LiftInOut, vec![K::new(Key::Z)]),
             (A::NudgeLeft, vec![K::new(Key::Comma)]),
             (A::NudgeRight, vec![K::new(Key::Period)]),

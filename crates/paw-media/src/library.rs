@@ -90,7 +90,9 @@ pub struct MediaLibrary {
     videos: HashMap<PathBuf, VideoSource>,
     frames: LruCache<(PathBuf, i64), Arc<RgbaImage>>,
     images: HashMap<PathBuf, Arc<RgbaImage>>,
-    audio: LruCache<(PathBuf, u64), Arc<Pcm>>,
+    /// Áudio decodificado: (arquivo, velocidade, variante). A variante 0 é o som original; as
+    /// outras são o mesmo som já com os efeitos de um clipe.
+    audio: LruCache<(PathBuf, u64, u64), Arc<Pcm>>,
     audio_bytes: usize,
     audio_budget: usize,
     failed: HashSet<PathBuf>,
@@ -188,14 +190,31 @@ impl MediaLibrary {
     /// Áudio do arquivo já na velocidade `speed`. Os menos usados saem da memória
     /// quando o total passa do orçamento (voltam do cache em disco se pedidos de novo).
     pub fn audio(&mut self, path: &Path, speed: f64) -> Result<Arc<Pcm>, MediaError> {
+        self.audio_variant(path, speed, 0, |pcm| pcm)
+    }
+
+    /// Como `audio`, mas para a variante `variant` (≠ 0): o som original passa por `process` uma
+    /// vez e o resultado fica guardado. Serve para os efeitos de áudio de um clipe.
+    pub fn audio_variant(
+        &mut self,
+        path: &Path,
+        speed: f64,
+        variant: u64,
+        process: impl FnOnce(Pcm) -> Pcm,
+    ) -> Result<Arc<Pcm>, MediaError> {
         self.check(path)?;
-        let key = (path.to_path_buf(), speed.to_bits());
+        let key = (path.to_path_buf(), speed.to_bits(), variant);
         if let Some(pcm) = self.audio.get(&key) {
             return Ok(pcm.clone());
         }
-        let loaded =
-            load_audio(path, self.sample_rate, speed, self.cache_dir.as_deref()).map(Arc::new);
-        let pcm = self.remember_failure(path, loaded)?;
+        let pcm = if variant == 0 {
+            let loaded =
+                load_audio(path, self.sample_rate, speed, self.cache_dir.as_deref()).map(Arc::new);
+            self.remember_failure(path, loaded)?
+        } else {
+            let base = self.audio(path, speed)?;
+            Arc::new(process((*base).clone()))
+        };
         self.audio_bytes += pcm.samples.len() * 4;
         self.audio.put(key, pcm.clone());
         self.evict_audio();
@@ -204,14 +223,27 @@ impl MediaLibrary {
 
     /// O áudio já decodificado, sem decodificar nada (`None` se ainda não está na memória).
     pub fn resident_audio(&mut self, path: &Path, speed: f64) -> Option<Arc<Pcm>> {
+        self.resident_audio_variant(path, speed, 0)
+    }
+
+    pub fn resident_audio_variant(
+        &mut self,
+        path: &Path,
+        speed: f64,
+        variant: u64,
+    ) -> Option<Arc<Pcm>> {
         self.audio
-            .get(&(path.to_path_buf(), speed.to_bits()))
+            .get(&(path.to_path_buf(), speed.to_bits(), variant))
             .cloned()
     }
 
     /// Guarda um áudio decodificado em outra thread (o player nunca decodifica sozinho).
     pub fn insert_audio(&mut self, path: &Path, speed: f64, pcm: Arc<Pcm>) {
-        let key = (path.to_path_buf(), speed.to_bits());
+        self.insert_audio_variant(path, speed, 0, pcm);
+    }
+
+    pub fn insert_audio_variant(&mut self, path: &Path, speed: f64, variant: u64, pcm: Arc<Pcm>) {
+        let key = (path.to_path_buf(), speed.to_bits(), variant);
         if let Some(old) = self.audio.pop(&key) {
             self.audio_bytes -= old.samples.len() * 4;
         }
@@ -247,7 +279,7 @@ impl MediaLibrary {
         let stale: Vec<_> = self
             .audio
             .iter()
-            .filter(|((p, _), _)| p == path)
+            .filter(|((p, _, _), _)| p == path)
             .map(|(k, _)| k.clone())
             .collect();
         for k in stale {

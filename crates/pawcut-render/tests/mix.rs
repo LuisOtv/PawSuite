@@ -250,3 +250,53 @@ fn track_volume_and_pan() {
         out[201]
     );
 }
+
+#[test]
+fn clip_audio_effects_change_the_mix_and_are_undoable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ed = editor();
+    let wav = kit::dc_audio(dir.path(), "a.wav", 0.4, 2.0);
+    let c = audio_clip(&mut ed, &wav, 0, 0, 60);
+    // sem efeito: o nível constante passa direto
+    assert!((mix(&ed, 60_000, 10)[0] - 0.4).abs() < 1e-3);
+    // um passa-altas tira o nível constante (DC) depois de assentar
+    set(
+        &mut ed,
+        c,
+        ClipChange::AudioFx(vec![AudioFx::HighPass { hz: 200.0 }]),
+    );
+    let filtered = mix(&ed, 60_000, 10);
+    assert!(filtered[0].abs() < 0.01, "{}", filtered[0]);
+    // desfazer volta ao som original
+    assert!(ed.undo());
+    assert!((mix(&ed, 60_000, 10)[0] - 0.4).abs() < 1e-3);
+    assert!(ed.redo());
+    // outro clipe da mesma mídia, sem efeito, segue com o original (a variante é por clipe)
+    let c2 = audio_clip(&mut ed, &wav, 1, 0, 60);
+    let both = mix(&ed, 60_000, 10);
+    assert!(
+        (both[0] - 0.4).abs() < 0.02,
+        "só o clipe sem efeito soa: {}",
+        both[0]
+    );
+    // valores fora da faixa são recusados e não mudam nada
+    for bad in [f32::NAN, 0.0, 9_999.0] {
+        assert!(
+            ed.apply(Edit::SetClip {
+                clip: c2,
+                change: ClipChange::AudioFx(vec![AudioFx::HighPass { hz: bad }]),
+            })
+            .is_err(),
+            "{bad}"
+        );
+    }
+    assert!(ed.project().clip(c2).unwrap().audio_fx.is_empty());
+    // o mesmo efeito de novo não é mudança
+    assert!(
+        ed.apply(Edit::SetClip {
+            clip: c,
+            change: ClipChange::AudioFx(vec![AudioFx::HighPass { hz: 200.0 }]),
+        })
+        .is_err()
+    );
+}

@@ -15,16 +15,19 @@ pub enum Panel {
     TimelineViewer,
     Inspector,
     Timeline,
+    /// Anotações do projeto.
+    Notes,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 6] = [
+    pub const ALL: [Panel; 7] = [
         Panel::MediaPool,
         Panel::Effects,
         Panel::SourceViewer,
         Panel::TimelineViewer,
         Panel::Inspector,
         Panel::Timeline,
+        Panel::Notes,
     ];
 
     pub fn title(self) -> &'static str {
@@ -35,6 +38,7 @@ impl Panel {
             Panel::TimelineViewer => "Timeline Viewer",
             Panel::Inspector => "Inspector",
             Panel::Timeline => "Timeline",
+            Panel::Notes => "Notas",
         }
     }
 }

@@ -246,6 +246,7 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
         return;
     }
     let ctx = ui.ctx().clone();
+    update_pen(st, &ctx);
     let cur = st.cur;
     if std::mem::take(&mut st.tool_changed)
         && st.tool == Tool::Transform
@@ -262,8 +263,14 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
         st.docs[cur].ed.doc().height as f32,
     );
     if st.docs[cur].fit {
-        st.docs[cur].zoom = ((area.width() - 40.0) / cw)
-            .min((area.height() - 40.0) / ch)
+        // O espaço que a imagem ocupa na janela quando girada.
+        let (sin, cos) = st.docs[cur].view_rot.to_radians().sin_cos();
+        let (ew, eh) = (
+            cw * cos.abs() + ch * sin.abs(),
+            cw * sin.abs() + ch * cos.abs(),
+        );
+        st.docs[cur].zoom = ((area.width() - 40.0) / ew)
+            .min((area.height() - 40.0) / eh)
             .clamp(0.02, 1.0)
             .max(0.02);
     }
@@ -296,29 +303,79 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
         }
     }
     let d = &st.docs[cur];
-    let size = vec2(cw, ch) * d.zoom;
-    let origin = area.center() + d.pan - size / 2.0;
-    let canvas = Rect::from_min_size(origin, size);
     let zoom = d.zoom;
-    let to_doc = move |p: Pos2| ((p - origin) / zoom).to_pos2();
-    let to_screen = move |x: f32, y: f32| origin + vec2(x, y) * zoom;
+    let xf = ViewXf::new(
+        area.center() + d.pan,
+        zoom,
+        d.view_rot,
+        d.view_flip,
+        (cw, ch),
+    );
+    let identity = xf.identity;
+    let origin = xf.project(0.0, 0.0);
+    let size = vec2(cw, ch) * zoom;
+    let canvas = Rect::from_min_size(origin, size);
+    let to_doc = move |p: Pos2| xf.unproject(p);
+    let to_screen = move |x: f32, y: f32| xf.project(x, y);
     let clip = ui.painter().with_clip_rect(area);
+    // os quatro cantos da imagem na janela (girada ou não)
+    let corners = [
+        to_screen(0.0, 0.0),
+        to_screen(cw, 0.0),
+        to_screen(cw, ch),
+        to_screen(0.0, ch),
+    ];
+    let quad = |tex: egui::TextureId, c: [Pos2; 4], uv: Rect| {
+        let mut mesh = Mesh::with_texture(tex);
+        let uvs = [
+            pos2(uv.left(), uv.top()),
+            pos2(uv.right(), uv.top()),
+            pos2(uv.right(), uv.bottom()),
+            pos2(uv.left(), uv.bottom()),
+        ];
+        for (p, uv) in c.iter().zip(uvs) {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: *p,
+                uv,
+                color: Color32::WHITE,
+            });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        Shape::mesh(mesh)
+    };
 
     // ---- desenho
     let checker_tex = checker(&ctx);
-    clip.image(
+    clip.add(quad(
         checker_tex.id(),
-        canvas,
+        corners,
         Rect::from_min_max(pos2(0.0, 0.0), pos2(cw / 16.0, ch / 16.0)),
-        Color32::WHITE,
-    );
+    ));
     if let Some(t) = &d.tex {
-        clip.image(
-            t.id(),
-            canvas,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        if st.wrap {
+            // Modo de repetição: as cópias em volta mostram a emenda.
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (ox, oy) = (dx as f32 * cw, dy as f32 * ch);
+                    clip.add(quad(
+                        t.id(),
+                        [
+                            to_screen(ox, oy),
+                            to_screen(ox + cw, oy),
+                            to_screen(ox + cw, oy + ch),
+                            to_screen(ox, oy + ch),
+                        ],
+                        full,
+                    ));
+                }
+            }
+        }
+        clip.add(quad(t.id(), corners, full));
     }
     if let Some(fs) = &d.float {
         let (x0, y0, x1, y1) = fs.f.bounds;
@@ -342,23 +399,26 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
         mesh.add_triangle(0, 2, 3);
         clip.add(Shape::mesh(mesh));
     } else if let Some((_, tex, (sx, sy))) = &d.sel_overlay {
-        let r = Rect::from_min_size(to_screen(*sx as f32, *sy as f32), tex.size_vec2() * zoom);
-        clip.image(
+        let (x0, y0) = (*sx as f32, *sy as f32);
+        let (x1, y1) = (x0 + tex.size_vec2().x, y0 + tex.size_vec2().y);
+        clip.add(quad(
             tex.id(),
-            r,
+            [
+                to_screen(x0, y0),
+                to_screen(x1, y0),
+                to_screen(x1, y1),
+                to_screen(x0, y1),
+            ],
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        ));
     }
-    clip.rect_stroke(
-        canvas,
-        0.0,
+    clip.add(Shape::closed_line(
+        corners.to_vec(),
         Stroke::new(1.0, Color32::BLACK),
-        egui::StrokeKind::Outside,
-    );
+    ));
 
     // Grade de pixels quando o zoom é bem alto (dá para ver cada pixel).
-    if zoom >= 8.0 {
+    if zoom >= 8.0 && identity {
         let vis = canvas.intersect(area);
         let g = Stroke::new(1.0, Color32::from_black_alpha(55));
         let (x0, x1) = (
@@ -380,49 +440,93 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
     }
     // Eixos do espelho.
     if st.mirror.0 {
-        let x = canvas.center().x;
         clip.line_segment(
-            [pos2(x, canvas.top()), pos2(x, canvas.bottom())],
+            [to_screen(cw / 2.0, 0.0), to_screen(cw / 2.0, ch)],
             Stroke::new(1.0, Color32::from_rgb(255, 80, 200)),
         );
     }
     if st.mirror.1 {
-        let y = canvas.center().y;
         clip.line_segment(
-            [pos2(canvas.left(), y), pos2(canvas.right(), y)],
+            [to_screen(0.0, ch / 2.0), to_screen(cw, ch / 2.0)],
             Stroke::new(1.0, Color32::from_rgb(255, 80, 200)),
         );
+    }
+    // Simetria radial: raios a partir do centro.
+    if st.symmetry > 1 {
+        let (mx, my) = (cw / 2.0, ch / 2.0);
+        let reach = (cw * cw + ch * ch).sqrt();
+        for k in 0..st.symmetry.min(32) {
+            let a = std::f32::consts::TAU * k as f32 / st.symmetry as f32;
+            clip.line_segment(
+                [
+                    to_screen(mx, my),
+                    to_screen(mx + a.cos() * reach, my + a.sin() * reach),
+                ],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 80, 200, 110)),
+            );
+        }
+    }
+    // Régua: a reta inteira (fina) e as duas pontas.
+    let ruler_ui = match st.interaction {
+        Some(Interaction::Ruler { start, cur }) => Some([start, cur]),
+        _ => d.ruler,
+    };
+    if let Some([a, b]) = ruler_ui {
+        let (sa, sb) = (to_screen(a.0, a.1), to_screen(b.0, b.1));
+        let dir = (sb - sa).normalized();
+        if dir.is_finite() {
+            let far = (cw + ch) * d.zoom.max(0.01) * 2.0;
+            let line = [sa - dir * far, sa + dir * far];
+            clip.line_segment(line, Stroke::new(3.0, Color32::from_black_alpha(120)));
+            clip.line_segment(line, Stroke::new(1.0, Color32::from_rgb(70, 200, 255)));
+        }
+        for p in [sa, sb] {
+            clip.circle_filled(p, 4.5, Color32::from_rgb(70, 200, 255));
+            clip.circle_stroke(p, 4.5, Stroke::new(1.0, Color32::BLACK));
+        }
     }
     // Corte em andamento: escurece o que sai.
     if let Some((x0, y0, x1, y1)) = d.crop {
         let r = Rect::from_two_pos(to_screen(x0, y0), to_screen(x1, y1));
         let dim = Color32::from_black_alpha(140);
-        clip.rect_filled(
-            Rect::from_min_max(canvas.min, pos2(canvas.right(), r.top())),
-            0.0,
-            dim,
-        );
-        clip.rect_filled(
-            Rect::from_min_max(pos2(canvas.left(), r.bottom()), canvas.max),
-            0.0,
-            dim,
-        );
-        clip.rect_filled(
-            Rect::from_min_max(pos2(canvas.left(), r.top()), pos2(r.left(), r.bottom())),
-            0.0,
-            dim,
-        );
-        clip.rect_filled(
-            Rect::from_min_max(pos2(r.right(), r.top()), pos2(canvas.right(), r.bottom())),
-            0.0,
-            dim,
-        );
-        clip.rect_stroke(
-            r,
-            0.0,
-            Stroke::new(1.5, Color32::WHITE),
-            egui::StrokeKind::Outside,
-        );
+        if !identity {
+            clip.add(Shape::closed_line(
+                vec![
+                    to_screen(x0, y0),
+                    to_screen(x1, y0),
+                    to_screen(x1, y1),
+                    to_screen(x0, y1),
+                ],
+                Stroke::new(1.5, Color32::WHITE),
+            ));
+        } else {
+            clip.rect_filled(
+                Rect::from_min_max(canvas.min, pos2(canvas.right(), r.top())),
+                0.0,
+                dim,
+            );
+            clip.rect_filled(
+                Rect::from_min_max(pos2(canvas.left(), r.bottom()), canvas.max),
+                0.0,
+                dim,
+            );
+            clip.rect_filled(
+                Rect::from_min_max(pos2(canvas.left(), r.top()), pos2(r.left(), r.bottom())),
+                0.0,
+                dim,
+            );
+            clip.rect_filled(
+                Rect::from_min_max(pos2(r.right(), r.top()), pos2(canvas.right(), r.bottom())),
+                0.0,
+                dim,
+            );
+            clip.rect_stroke(
+                r,
+                0.0,
+                Stroke::new(1.5, Color32::WHITE),
+                egui::StrokeKind::Outside,
+            );
+        }
         clip.text(
             r.left_top() + vec2(4.0, -14.0),
             Align2::LEFT_TOP,
@@ -482,22 +586,22 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
             let st_b = Stroke::new(1.0, Color32::BLACK);
             match tool {
                 Tool::SelRect => {
-                    let r =
-                        Rect::from_two_pos(to_screen(start.0, start.1), to_screen(cur.0, cur.1));
-                    clip.rect_stroke(r, 0.0, st_b, egui::StrokeKind::Middle);
-                    clip.rect_stroke(r.shrink(1.0), 0.0, st_a, egui::StrokeKind::Middle);
-                }
-                Tool::SelEllipse => {
-                    let r =
-                        Rect::from_two_pos(to_screen(start.0, start.1), to_screen(cur.0, cur.1));
-                    clip.add(egui::epaint::EllipseShape::stroke(
-                        r.center(),
-                        r.size() / 2.0,
+                    clip.add(Shape::closed_line(
+                        rect_path(&to_screen, *start, *cur),
                         st_b,
                     ));
-                    clip.add(egui::epaint::EllipseShape::stroke(
-                        r.center(),
-                        (r.size() / 2.0 - vec2(1.0, 1.0)).max(Vec2::ZERO),
+                    clip.add(Shape::closed_line(
+                        rect_path(&to_screen, *start, *cur),
+                        st_a,
+                    ));
+                }
+                Tool::SelEllipse => {
+                    clip.add(Shape::closed_line(
+                        ellipse_path(&to_screen, *start, *cur),
+                        st_b,
+                    ));
+                    clip.add(Shape::closed_line(
+                        ellipse_path(&to_screen, *start, *cur),
                         st_a,
                     ));
                 }
@@ -530,19 +634,11 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
                     clip.line_segment([to_screen(start.0, start.1), to_screen(cur.0, cur.1)], st_);
                 }
                 Tool::Rect => {
-                    clip.rect_stroke(
-                        Rect::from_two_pos(to_screen(start.0, start.1), to_screen(cur.0, cur.1)),
-                        0.0,
-                        st_,
-                        egui::StrokeKind::Middle,
-                    );
+                    clip.add(Shape::closed_line(rect_path(&to_screen, *start, cur), st_));
                 }
                 _ => {
-                    let r =
-                        Rect::from_two_pos(to_screen(start.0, start.1), to_screen(cur.0, cur.1));
-                    clip.add(egui::epaint::EllipseShape::stroke(
-                        r.center(),
-                        r.size() / 2.0,
+                    clip.add(Shape::closed_line(
+                        ellipse_path(&to_screen, *start, cur),
                         st_,
                     ));
                 }
@@ -591,6 +687,34 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
         }
     }
 
+    // Carimbo de clone: cruz onde está a origem (anda junto com o cursor).
+    if st.tool == Tool::Clone
+        && let Some(src) = st.clone_source
+    {
+        let at = match (st.clone_offset, doc_pos) {
+            (Some(off), Some(p)) => to_screen(p.x + off.0, p.y + off.1),
+            _ => to_screen(src.0, src.1),
+        };
+        let r = 7.0;
+        for (c, w) in [(Color32::BLACK, 3.0), (Color32::WHITE, 1.5)] {
+            clip.line_segment([at - vec2(r, 0.0), at + vec2(r, 0.0)], Stroke::new(w, c));
+            clip.line_segment([at - vec2(0.0, r), at + vec2(0.0, r)], Stroke::new(w, c));
+        }
+    }
+    // Ajustando o tamanho (Alt + arrastar): círculo e número no ponto onde começou.
+    if let Some(Interaction::BrushSize { origin, .. }) = st.interaction {
+        let r = (st.brush.size * zoom / 2.0).max(1.5);
+        clip.circle_stroke(origin, r, Stroke::new(1.0, Color32::BLACK));
+        clip.circle_stroke(origin, r + 1.0, Stroke::new(1.0, Color32::WHITE));
+        clip.text(
+            origin + vec2(0.0, r + 8.0),
+            egui::Align2::CENTER_TOP,
+            format!("{:.0} px", st.brush.size),
+            egui::FontId::proportional(13.0),
+            Color32::WHITE,
+        );
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+    }
     // Cursor: círculo do pincel nas ferramentas de pintura.
     if over && st.interaction.is_none()
         || matches!(
@@ -630,6 +754,7 @@ pub fn canvas_panel(st: &mut State, ui: &mut egui::Ui) {
         }
     }
     st.docs[cur].view_origin = origin;
+    st.docs[cur].view_center = xf.center_point();
     text_popup(st, ui, &to_screen);
     if space && resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::Grab);
@@ -659,10 +784,14 @@ fn doc_tabs(st: &mut State, ui: &mut egui::Ui) {
                     if ui.selectable_label(selected, d.title()).clicked() {
                         select = Some(i);
                     }
-                    if ui
-                        .add(egui::Button::new("×").frame(false).small())
-                        .on_hover_text("Fechar o documento")
-                        .clicked()
+                    if paw_ui::icons::button(
+                        ui,
+                        paw_ui::icons::Icon::Close,
+                        11.0,
+                        false,
+                        "Fechar o documento",
+                    )
+                    .clicked()
                     {
                         close = Some(i);
                     }
@@ -700,6 +829,28 @@ fn sel_op(st: &State, mods: egui::Modifiers) -> SelOp {
     }
 }
 
+/// Ponto mais próximo de `pt` na reta da régua.
+fn project_on_ruler(r: [(f32, f32); 2], pt: (f32, f32)) -> (f32, f32) {
+    let (dx, dy) = (r[1].0 - r[0].0, r[1].1 - r[0].1);
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-6 {
+        return pt;
+    }
+    let t = ((pt.0 - r[0].0) * dx + (pt.1 - r[0].1) * dy) / len2;
+    (r[0].0 + dx * t, r[0].1 + dy * t)
+}
+
+/// O ponto do traço, preso à régua quando o traço começou perto dela.
+fn ruled(st: &State, pt: (f32, f32)) -> (f32, f32) {
+    match (st.ruler_lock, st.docs.get(st.cur).and_then(|d| d.ruler)) {
+        (true, Some(r)) => project_on_ruler(r, pt),
+        _ => pt,
+    }
+}
+
+/// Até que distância (em pixels de tela) da régua um traço fica preso a ela.
+const RULER_SNAP: f32 = 28.0;
+
 fn start_interaction(
     st: &mut State,
     ctx: &egui::Context,
@@ -712,7 +863,18 @@ fn start_interaction(
     let cur = st.cur;
     let pt = (p.x, p.y);
     if pan {
-        st.interaction = Some(Interaction::Pan);
+        // Shift + Espaço + arrastar gira a visão (como no Krita); só Espaço move.
+        if mods.shift {
+            let c = st.docs[cur].view_center;
+            let last = (screen.y - c.y).atan2(screen.x - c.x).to_degrees();
+            st.interaction = Some(Interaction::RotateView { last });
+        } else {
+            st.interaction = Some(Interaction::Pan);
+        }
+        return;
+    }
+    if st.placing_ruler {
+        st.interaction = Some(Interaction::Ruler { start: pt, cur: pt });
         return;
     }
     // Ctrl+clique com ferramentas de pintura pega a cor (como no Krita).
@@ -722,6 +884,7 @@ fn start_interaction(
             Tool::Brush
                 | Tool::Eraser
                 | Tool::Smudge
+                | Tool::Clone
                 | Tool::Fill
                 | Tool::Gradient
                 | Tool::Line
@@ -762,8 +925,27 @@ fn start_interaction(
         });
         return;
     }
+    // Carimbo de clone: Alt+clique escolhe a origem; sem origem não pinta.
+    let cloning = st.tool == Tool::Clone;
+    if cloning && mods.alt {
+        st.clone_source = Some(pt);
+        st.clone_offset = None;
+        st.say("Origem escolhida. Agora pinte onde quiser copiar.");
+        return;
+    }
+    if cloning && st.clone_source.is_none() {
+        st.warn("Alt+clique escolhe de onde copiar");
+        return;
+    }
+    if mods.alt && matches!(st.tool, Tool::Brush | Tool::Eraser | Tool::Smudge) {
+        st.interaction = Some(Interaction::BrushSize {
+            origin: screen,
+            start: st.brush.size,
+        });
+        return;
+    }
     match st.tool {
-        Tool::Brush | Tool::Eraser => {
+        Tool::Brush | Tool::Eraser | Tool::Clone => {
             let erase = st.tool == Tool::Eraser;
             let mode = if erase {
                 pawpaint_core::BlendMode::Normal
@@ -771,7 +953,15 @@ fn start_interaction(
                 st.blend
             };
             let (brush, color) = (st.brush.clone(), st.fg);
+            let zoom = st.docs[cur].zoom.max(0.01);
+            st.ruler_lock = st.docs[cur].ruler.is_some_and(|r| {
+                let q = project_on_ruler(r, pt);
+                (q.0 - pt.0).hypot(q.1 - pt.1) * zoom <= RULER_SNAP
+            });
+            let pt = ruled(st, pt);
             st.docs[cur].ed.set_mirror(st.mirror.0, st.mirror.1);
+            st.docs[cur].ed.set_wrap(st.wrap);
+            st.docs[cur].ed.set_radial(st.symmetry);
             // Na máscara: cor escura esconde, cor clara revela (a borracha sempre revela).
             let on_mask = st.docs[cur].edit_mask
                 && st.docs[cur]
@@ -787,7 +977,22 @@ fn start_interaction(
                 .begin_stroke(active, brush, color, erase, mode)
             {
                 Ok(()) => {
-                    st.docs[cur].ed.stroke_point(pt.0, pt.1);
+                    if cloning && let Some(src) = st.clone_source {
+                        let off = *st.clone_offset.get_or_insert((src.0 - pt.0, src.1 - pt.1));
+                        st.docs[cur].ed.set_clone_source(off);
+                    }
+                    let pressure = st.pen.unwrap_or(1.0);
+                    // Shift+clique: reta desde onde o último traço terminou.
+                    if mods.shift
+                        && !cloning
+                        && let Some(prev) = st.docs[cur].last_stroke_end
+                    {
+                        st.docs[cur]
+                            .ed
+                            .stroke_point_pressure(prev.0, prev.1, pressure);
+                    }
+                    st.docs[cur].ed.stroke_point_pressure(pt.0, pt.1, pressure);
+                    st.docs[cur].last_stroke_end = Some(pt);
                     st.interaction = Some(Interaction::Stroke);
                 }
                 Err(e) => st.warn(e.to_string()),
@@ -928,8 +1133,28 @@ fn update_interaction(
         return;
     };
     match inter {
-        Interaction::Stroke => st.docs[cur].ed.stroke_point(pt.0, pt.1),
+        Interaction::Stroke => {
+            let pressure = st.pen.unwrap_or(1.0);
+            let pt = ruled(st, pt);
+            st.docs[cur].ed.stroke_point_pressure(pt.0, pt.1, pressure)
+        }
+        Interaction::Ruler { cur: c, .. } => *c = pt,
         Interaction::Smudge => st.docs[cur].ed.smudge_point(pt.0, pt.1),
+        Interaction::RotateView { last } => {
+            let d = &mut st.docs[cur];
+            let c = d.view_center;
+            let now = (screen.y - c.y).atan2(screen.x - c.x).to_degrees();
+            let mut step = now - *last;
+            // dá a volta em ±180°
+            if step > 180.0 {
+                step -= 360.0;
+            } else if step < -180.0 {
+                step += 360.0;
+            }
+            *last = now;
+            rotate_view(d, step);
+            d.fit = false;
+        }
         Interaction::Pan => {
             let d = &mut st.docs[cur];
             d.pan += ctx.input(|i| i.pointer.delta());
@@ -939,6 +1164,11 @@ fn update_interaction(
         Interaction::Picker => {
             let to_bg = mods.shift;
             pick_color(st, pt, to_bg);
+        }
+        Interaction::BrushSize { origin, start } => {
+            // o raio acompanha o cursor: 1 px de tela = 2/zoom de diâmetro
+            let zoom = st.docs[cur].zoom.max(0.01);
+            st.brush.size = (*start + (screen.x - origin.x) * 2.0 / zoom).clamp(1.0, 500.0);
         }
         Interaction::Gradient { cur: c, .. } => *c = pt,
         Interaction::Select {
@@ -1000,7 +1230,18 @@ fn finish_interaction(st: &mut State, pt: (f32, f32), _mods: egui::Modifiers) {
     let (w, h) = (st.docs[cur].ed.doc().width, st.docs[cur].ed.doc().height);
     let active = st.docs[cur].active;
     match inter {
-        Interaction::Stroke => st.docs[cur].ed.end_stroke(pt.0, pt.1),
+        Interaction::Stroke => {
+            let pt = ruled(st, pt);
+            st.ruler_lock = false;
+            st.docs[cur].ed.end_stroke(pt.0, pt.1);
+            st.docs[cur].last_stroke_end = Some(pt);
+        }
+        Interaction::Ruler { start, cur: end } => {
+            st.placing_ruler = false;
+            if (start.0 - end.0).hypot(start.1 - end.1) * st.docs[cur].zoom >= 8.0 {
+                st.docs[cur].ruler = Some([start, end]);
+            }
+        }
         Interaction::Smudge => st.docs[cur].ed.end_smudge(),
         Interaction::Gradient { start, cur: end } => {
             if (start.0 - end.0).hypot(start.1 - end.1) < 2.0 {
@@ -1071,7 +1312,11 @@ fn finish_interaction(st: &mut State, pt: (f32, f32), _mods: egui::Modifiers) {
                 commit_float(&mut st.docs[cur]);
             }
         }
-        Interaction::Pan | Interaction::Picker | Interaction::Crop { .. } => {}
+        Interaction::Pan
+        | Interaction::RotateView { .. }
+        | Interaction::Picker
+        | Interaction::BrushSize { .. }
+        | Interaction::Crop { .. } => {}
     }
 }
 
@@ -1353,4 +1598,118 @@ mod tests {
             assert_eq!(img.pixels[y * 1100 + x], want, "pixel {x},{y}");
         }
     }
+}
+
+/// Guarda a pressão da caneta: vem dos eventos de toque com força (caneta ou tela sensível).
+/// Quando o toque termina (ou nunca houve toque, como no mouse) volta a `None`.
+fn update_pen(st: &mut State, ctx: &egui::Context) {
+    ctx.input(|i| {
+        for e in &i.events {
+            if let egui::Event::Touch { phase, force, .. } = e {
+                match phase {
+                    egui::TouchPhase::End | egui::TouchPhase::Cancel => st.pen = None,
+                    _ => {
+                        if let Some(f) = force {
+                            st.pen = Some(f.clamp(0.0, 1.0));
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Como a imagem é levada para a janela: zoom, posição do centro, giro e espelho da visão.
+/// Sem giro nem espelho as contas são exatamente as de antes (pixels não mudam de lugar).
+#[derive(Clone, Copy)]
+pub struct ViewXf {
+    center: Pos2,
+    zoom: f32,
+    sin: f32,
+    cos: f32,
+    flip: bool,
+    half: Vec2,
+    pub identity: bool,
+}
+
+impl ViewXf {
+    pub fn new(center: Pos2, zoom: f32, rot_deg: f32, flip: bool, doc: (f32, f32)) -> Self {
+        let (sin, cos) = rot_deg.to_radians().sin_cos();
+        Self {
+            center,
+            zoom,
+            sin,
+            cos,
+            flip,
+            half: vec2(doc.0, doc.1) / 2.0,
+            identity: rot_deg == 0.0 && !flip,
+        }
+    }
+
+    pub fn center_point(&self) -> Pos2 {
+        self.center
+    }
+
+    pub fn project(&self, x: f32, y: f32) -> Pos2 {
+        if self.identity {
+            return self.center - self.half * self.zoom + vec2(x, y) * self.zoom;
+        }
+        let mut v = vec2(x, y) - self.half;
+        if self.flip {
+            v.x = -v.x;
+        }
+        let r = vec2(
+            v.x * self.cos - v.y * self.sin,
+            v.x * self.sin + v.y * self.cos,
+        );
+        self.center + r * self.zoom
+    }
+
+    pub fn unproject(&self, p: Pos2) -> Pos2 {
+        if self.identity {
+            return ((p - (self.center - self.half * self.zoom)) / self.zoom).to_pos2();
+        }
+        let r = (p - self.center) / self.zoom;
+        let mut v = vec2(
+            r.x * self.cos + r.y * self.sin,
+            -r.x * self.sin + r.y * self.cos,
+        );
+        if self.flip {
+            v.x = -v.x;
+        }
+        (v + self.half).to_pos2()
+    }
+}
+
+/// Contorno de um retângulo da imagem (dois cantos opostos) na janela.
+fn rect_path(to_screen: &dyn Fn(f32, f32) -> Pos2, a: (f32, f32), b: (f32, f32)) -> Vec<Pos2> {
+    vec![
+        to_screen(a.0, a.1),
+        to_screen(b.0, a.1),
+        to_screen(b.0, b.1),
+        to_screen(a.0, b.1),
+    ]
+}
+
+/// Contorno da elipse que cabe no retângulo `a`–`b`, em 72 pontos.
+fn ellipse_path(to_screen: &dyn Fn(f32, f32) -> Pos2, a: (f32, f32), b: (f32, f32)) -> Vec<Pos2> {
+    let (cx, cy) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    let (rx, ry) = ((b.0 - a.0).abs() / 2.0, (b.1 - a.1).abs() / 2.0);
+    (0..72)
+        .map(|i| {
+            let t = i as f32 / 72.0 * std::f32::consts::TAU;
+            to_screen(cx + rx * t.cos(), cy + ry * t.sin())
+        })
+        .collect()
+}
+
+/// Gira a visão `delta` graus (positivo = sentido horário) e mantém o ângulo em (−180, 180].
+pub fn rotate_view(d: &mut crate::state::DocView, delta: f32) {
+    let mut a = (d.view_rot + delta) % 360.0;
+    if a > 180.0 {
+        a -= 360.0;
+    } else if a <= -180.0 {
+        a += 360.0;
+    }
+    d.view_rot = a;
 }

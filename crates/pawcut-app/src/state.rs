@@ -73,6 +73,10 @@ pub struct AppState {
 }
 
 /// Duração padrão de geradores e imagens soltos na timeline: 5 segundos.
+fn fmt_secs(s: f64) -> String {
+    format!("{s:.1}")
+}
+
 pub fn default_still_frames(project: &Project) -> Frame {
     project.settings.fps.seconds_to_frames(5.0).max(1)
 }
@@ -756,6 +760,372 @@ impl AppState {
         }
     }
 
+    /// Rampa de velocidade: o clipe selecionado (com o áudio ligado) vira `steps` pedaços cuja
+    /// velocidade vai de `from` a `to` (múltiplos da velocidade atual: 1,0 = igual). O resto da
+    /// faixa anda junto para acompanhar a duração nova.
+    pub fn speed_ramp(&mut self, from: f64, to: f64, steps: usize) {
+        let p = self.project().clone();
+        let steps = steps.clamp(2, 24);
+        if !from.is_finite() || !to.is_finite() {
+            self.warn("Velocidade inválida na rampa");
+            return;
+        }
+        let (from, to) = (from.clamp(0.1, 10.0), to.clamp(0.1, 10.0));
+        let Some(first) = self.selection.iter().copied().find(|c| {
+            p.clip(*c)
+                .is_some_and(|c| matches!(c.source, ClipSource::Media(_)))
+        }) else {
+            self.warn("Selecione um clipe de vídeo ou áudio");
+            return;
+        };
+        let group = p.expand_linked(&[first]);
+        // (faixa, clipe) de cada membro do grupo
+        let members: Vec<(TrackId, Clip)> = group
+            .iter()
+            .filter_map(|id| {
+                let (t, _) = p.locate(*id)?;
+                Some((t, p.clip(*id)?.clone()))
+            })
+            .collect();
+        let Some((_, lead)) = members.first().cloned() else {
+            return;
+        };
+        let (start, dur) = (lead.start, lead.duration);
+        if dur < steps as Frame * 2 {
+            self.warn("O clipe é curto demais para uma rampa");
+            return;
+        }
+        // Em cada pedaço: o trecho da fonte e a velocidade dele.
+        let base_speed = lead.speed;
+        let piece_src = dur as f64 * base_speed / steps as f64;
+        let mut pieces: Vec<(f64, f64, Frame)> = Vec::new(); // (source_start, speed, duração)
+        for i in 0..steps {
+            let t = (i as f64 + 0.5) / steps as f64;
+            let speed = (base_speed * (from + (to - from) * t)).clamp(0.1, 10.0);
+            let d = ((piece_src / speed).round() as Frame).max(1);
+            pieces.push((lead.source_start + piece_src * i as f64, speed, d));
+        }
+        let new_total: Frame = pieces.iter().map(|p| p.2).sum();
+        let tracks: Vec<TrackId> = members.iter().map(|(t, _)| *t).collect();
+        // Os clipes depois do original nessas faixas (e os ligados a eles) andam junto.
+        let later: Vec<ClipId> = tracks
+            .iter()
+            .filter_map(|t| p.track(*t))
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.start >= start + dur)
+            .map(|c| c.id)
+            .collect();
+        let later = p.expand_linked(&later);
+        self.apply_coalescing(Edit::Delete { clips: group }, "ramp");
+        let delta = new_total - dur;
+        if delta != 0 && !later.is_empty() {
+            self.apply_coalescing(
+                Edit::Move {
+                    clips: later,
+                    delta,
+                    video_track_delta: 0,
+                    audio_track_delta: 0,
+                },
+                "ramp",
+            );
+        }
+        let mut pasted = Vec::new();
+        for (tid, orig) in &members {
+            let mut at = 0;
+            for (i, (src, speed, d)) in pieces.iter().enumerate() {
+                let mut c = orig.clone();
+                c.start = at;
+                c.duration = *d;
+                c.source_start = *src;
+                c.speed = *speed;
+                c.fade_in = if i == 0 { orig.fade_in.min(*d) } else { 0 };
+                c.fade_out = if i + 1 == steps {
+                    orig.fade_out.min(*d)
+                } else {
+                    0
+                };
+                // keyframes pertencem ao clipe inteiro: só o primeiro pedaço os leva
+                if i > 0 {
+                    c.keyframes.clear();
+                }
+                c.link = orig.link.map(|_| LinkId(9_000_000 + i as u64));
+                pasted.push((*tid, c));
+                at += *d;
+            }
+        }
+        match self.editor.apply_coalescing(
+            Edit::Paste {
+                at: start,
+                clips: pasted,
+            },
+            "ramp",
+        ) {
+            Ok(o) => self.selection = o.clips,
+            Err(e) => self.say(e.to_string()),
+        }
+        self.editor.end_coalescing();
+        self.say(format!(
+            "Rampa de {from:.1}× a {to:.1}× em {steps} passos ({} s)",
+            fmt_secs(p.settings.fps.frames_to_seconds(new_total))
+        ));
+    }
+
+    /// Aplica o resultado do estabilizador no clipe: keyframes de posição (X e Y) a cada 2 frames
+    /// e um zoom que esconde as bordas. Troca os keyframes de posição que já existiam.
+    pub fn apply_stabilization(&mut self, clip: ClipId, result: &crate::stabilize::Stabilization) {
+        let p = self.project().clone();
+        let Some(c) = p.clip(clip).cloned() else {
+            return;
+        };
+        if result.moves.is_empty() {
+            return;
+        }
+        let (pw, ph) = (p.settings.width as f32, p.settings.height as f32);
+        // `clamp` com limite NaN derruba o app: números ruins viram 0.
+        let m = if result.max_move.is_finite() {
+            result.max_move.clamp(0.0, pw.min(ph) / 3.0)
+        } else {
+            0.0
+        };
+        let fit = |v: f32| if v.is_finite() { v.clamp(-m, m) } else { 0.0 };
+        let zoom = (((pw + 2.0 * m) / pw).max((ph + 2.0 * m) / ph)).clamp(1.0, 1.5);
+        let mut t = c.transform;
+        t.scale = (t.scale * zoom).clamp(0.05, 10.0);
+        self.apply_coalescing(
+            Edit::SetClip {
+                clip,
+                change: ClipChange::Transform(t),
+            },
+            "stabilize",
+        );
+        for param in [Param::X, Param::Y] {
+            self.apply_coalescing(Edit::ClearKeyframes { clip, param }, "stabilize");
+        }
+        let last = result.moves.len() - 1;
+        for (i, (mx, my)) in result.moves.iter().enumerate() {
+            if i % 2 != 0 && i != last {
+                continue;
+            }
+            let at = c.source_start + i as f64 * c.speed;
+            for (param, v) in [(Param::X, t.x + fit(*mx)), (Param::Y, t.y + fit(*my))] {
+                self.apply_coalescing(
+                    Edit::SetKeyframe {
+                        clip,
+                        param,
+                        at,
+                        value: Some(v),
+                    },
+                    "stabilize",
+                );
+            }
+        }
+        self.editor.end_coalescing();
+        self.say(format!(
+            "Imagem estabilizada (zoom de {:.0} % para esconder as bordas)",
+            (zoom - 1.0) * 100.0 + 100.0
+        ));
+    }
+
+    /// Slideshow: coloca no fim da primeira faixa de vídeo todas as imagens do Media Pool, em
+    /// ordem, `secs` segundos cada, com um dissolve de `dissolve` segundos entre elas.
+    /// Devolve quantas imagens entraram.
+    pub fn slideshow(&mut self, secs: f64, dissolve: f64) -> usize {
+        let p = self.project().clone();
+        let images: Vec<MediaId> = p
+            .media
+            .iter()
+            .filter(|m| matches!(m.info.kind, MediaKind::Image))
+            .map(|m| m.id)
+            .collect();
+        if images.is_empty() {
+            self.warn("Importe imagens para o Media Pool primeiro");
+            return 0;
+        }
+        let fps = p.settings.fps;
+        let len = fps.seconds_to_frames(secs.clamp(0.2, 600.0)).max(1);
+        let fade = fps
+            .seconds_to_frames(dissolve.clamp(0.0, 10.0))
+            .min(len.saturating_sub(1));
+        let track = self.ensure_track(TrackKind::Video, 0);
+        let mut clips = Vec::new();
+        for media in &images {
+            let item = Placement {
+                track,
+                draft: ClipDraft {
+                    source: ClipSource::Media(*media),
+                    source_start: 0.0,
+                    duration: len,
+                },
+            };
+            if let Some(o) = self.apply(Edit::Append { items: vec![item] }) {
+                clips.extend(o.clips);
+            }
+        }
+        if fade > 0 {
+            for c in clips.iter().skip(1) {
+                self.apply(Edit::SetDissolve {
+                    clip: *c,
+                    frames: fade,
+                });
+            }
+        }
+        self.selection = clips.clone();
+        self.say(format!("Slideshow com {} imagem(ns)", clips.len()));
+        clips.len()
+    }
+
+    /// Auto-duck: nos clipes de áudio selecionados (a música) o volume cai `duck_db` enquanto os
+    /// outros clipes de áudio (a voz) passam de `threshold_db`. Vira keyframes de volume.
+    pub fn auto_duck(&mut self, threshold_db: f32, duck_db: f32) {
+        let p = self.project().clone();
+        let fps = p.settings.fps;
+        let is_audio = |id: ClipId| {
+            p.locate(id)
+                .and_then(|(t, _)| p.track(t))
+                .is_some_and(|t| t.kind == TrackKind::Audio)
+        };
+        let music: Vec<ClipId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| is_audio(*id))
+            .collect();
+        if music.is_empty() {
+            self.warn("Selecione os clipes de áudio da música (a voz fica nas outras faixas)");
+            return;
+        }
+        let voices: Vec<&Clip> = p
+            .audio_tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .filter(|c| {
+                c.enabled && !music.contains(&c.id) && matches!(c.source, ClipSource::Media(_))
+            })
+            .collect();
+        if voices.is_empty() {
+            self.warn("Não há outro áudio na timeline para a música abaixar");
+            return;
+        }
+        let attack = fps.seconds_to_frames(0.15).max(1);
+        let release = fps.seconds_to_frames(0.6).max(1);
+        let min_gap = fps.seconds_to_frames(0.5).max(1) as usize;
+        let min_len = fps.seconds_to_frames(0.2).max(1) as usize;
+        let mut ducked = 0;
+        for id in &music {
+            let Some(clip) = p.clip(*id) else { continue };
+            let levels = crate::analysis::levels_per_frame(&p, &voices, clip.start, clip.end());
+            let ranges = crate::analysis::active_ranges(&levels, threshold_db, min_gap, min_len);
+            if ranges.is_empty() {
+                continue;
+            }
+            self.apply_coalescing(
+                Edit::ClearKeyframes {
+                    clip: *id,
+                    param: Param::VolumeDb,
+                },
+                "duck",
+            );
+            let base = clip.volume_db;
+            let low = (base - duck_db.abs()).max(-96.0);
+            // tempo da fonte (frames do projeto a 1x) de um frame da timeline
+            let src = |f: Frame| clip.source_start + (f - clip.start) as f64 * clip.speed;
+            let kf = |at: Frame, value: f32| {
+                let at = at.clamp(clip.start, clip.end() - 1);
+                (src(at), value)
+            };
+            let mut points: Vec<(f64, f32)> = vec![kf(clip.start, base)];
+            for (a, b) in ranges {
+                let (a, b) = (clip.start + a as Frame, clip.start + b as Frame);
+                points.push(kf(a - attack, base));
+                points.push(kf(a, low));
+                points.push(kf(b, low));
+                points.push(kf(b + release, base));
+            }
+            points.push(kf(clip.end() - 1, base));
+            // pontos repetidos (clamp nas pontas) ficam só com o último
+            points.dedup_by(|b, a| {
+                (a.0 - b.0).abs() < 1e-9 && {
+                    a.1 = b.1;
+                    true
+                }
+            });
+            for (at, value) in points {
+                self.apply_coalescing(
+                    Edit::SetKeyframe {
+                        clip: *id,
+                        param: Param::VolumeDb,
+                        at,
+                        value: Some(value),
+                    },
+                    "duck",
+                );
+            }
+            ducked += 1;
+        }
+        self.editor.end_coalescing();
+        if ducked == 0 {
+            self.say("Ninguém falou acima do limiar: nada para abaixar");
+        } else {
+            self.say(format!(
+                "Música abaixa {:.0} dB quando há voz ({ducked} clipe(s))",
+                duck_db.abs()
+            ));
+        }
+    }
+
+    /// Alinha os clipes selecionados pelo som: o primeiro selecionado é a referência (a câmera)
+    /// e os outros (o microfone) andam até o som casar. O vídeo ligado vai junto.
+    pub fn align_selection_by_audio(&mut self) {
+        let p = self.project().clone();
+        let ids: Vec<ClipId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| {
+                p.clip(*id)
+                    .is_some_and(|c| matches!(c.source, ClipSource::Media(_)))
+            })
+            .collect();
+        let [first, rest @ ..] = ids.as_slice() else {
+            self.warn("Selecione pelo menos dois clipes com áudio (o primeiro é a referência)");
+            return;
+        };
+        if rest.is_empty() {
+            self.warn("Selecione pelo menos dois clipes com áudio (o primeiro é a referência)");
+            return;
+        }
+        let reference = p.clip(*first).expect("clipe existe").clone();
+        let mut moved = 0;
+        let mut weak = 0;
+        for id in rest {
+            let Some(other) = p.clip(*id) else { continue };
+            match crate::analysis::align_by_audio(&p, &reference, other) {
+                Some((delta, conf)) if conf >= 6.0 => {
+                    if delta != 0 {
+                        let group = p.expand_linked(&[*id]);
+                        self.apply_coalescing(
+                            Edit::Move {
+                                clips: group,
+                                delta,
+                                video_track_delta: 0,
+                                audio_track_delta: 0,
+                            },
+                            "align-audio",
+                        );
+                    }
+                    moved += 1;
+                }
+                _ => weak += 1,
+            }
+        }
+        self.editor.end_coalescing();
+        match (moved, weak) {
+            (0, _) => self.warn("Não achei o mesmo som nos clipes (precisam ter áudio parecido)"),
+            (n, 0) => self.say(format!("{n} clipe(s) alinhado(s) pelo áudio")),
+            (n, w) => self.say(format!("{n} alinhado(s); {w} sem som em comum")),
+        }
+    }
+
     /// Cria uma faixa de vídeo nova em cima com uma legenda (estilo "Legenda") por fala.
     pub fn import_subtitles(&mut self, cues: &[Cue]) -> usize {
         if cues.is_empty() {
@@ -790,6 +1160,7 @@ impl AppState {
             dissolve_color: None,
             blur_fill: false,
             chroma: None,
+            audio_fx: Vec::new(),
         };
         let clips: Vec<(TrackId, Clip)> = cues
             .iter()
@@ -1535,6 +1906,200 @@ mod tests {
         s.set_playhead(140);
         s.add_dissolve();
         assert_eq!(s.project().video_tracks[0].clips[1].dissolve_in, 30);
+    }
+
+    #[test]
+    fn speed_ramp_splits_the_clip_and_the_rest_follows() {
+        let mut s = state();
+        let m = add_video(&mut s, 600, true);
+        s.drop_media(m, TrackKind::Video, 0, 0);
+        // um clipe depois do primeiro, para ver o resto andar
+        let m2 = add_video(&mut s, 300, true);
+        s.drop_media(m2, TrackKind::Video, 0, 400);
+        let first = s.project().video_tracks[0].clips[0].id;
+        s.selection = vec![first];
+        // de 1× a 3× em 6 pedaços: 600 frames de fonte
+        s.speed_ramp(1.0, 3.0, 6);
+        let v = &s.project().video_tracks[0].clips;
+        assert_eq!(v.len(), 7, "6 pedaços + o clipe de depois");
+        // velocidades crescentes, fontes contínuas, nada de buracos
+        for w in v[..6].windows(2) {
+            assert!(w[1].speed > w[0].speed);
+            assert_eq!(w[1].start, w[0].end(), "encostados");
+            let src_end = w[0].source_start + w[0].duration as f64 * w[0].speed;
+            assert!((src_end - w[1].source_start).abs() < 1.0, "fonte contínua");
+        }
+        let used: f64 = v[..6].iter().map(|c| c.duration as f64 * c.speed).sum();
+        assert!((used - 400.0).abs() < 8.0, "usa o trecho da fonte: {used}");
+        // o áudio ligado acompanha, com os mesmos tempos
+        let a = &s.project().audio_tracks[0].clips;
+        assert_eq!(a.len(), 7);
+        assert_eq!(a[0].duration, v[0].duration);
+        assert!(a[..6].iter().zip(&v[..6]).all(|(x, y)| x.start == y.start));
+        // o último clipe andou exatamente o que a rampa encurtou/alongou
+        let new_total: i64 = v[..6].iter().map(|c| c.duration).sum();
+        assert_eq!(v[6].start, 400 + (new_total - 400));
+        // um desfazer volta tudo
+        s.undo();
+        let v = &s.project().video_tracks[0].clips;
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].start, v[0].duration, v[1].start), (0, 400, 400));
+    }
+
+    /// Valores absurdos nas ferramentas novas: nada derruba o app nem deixa a timeline quebrada.
+    #[test]
+    fn new_tools_survive_absurd_values() {
+        let weird = [f64::NAN, f64::INFINITY, -5.0, 0.0, 1e9];
+        let mut s = state();
+        let m = add_video(&mut s, 600, true);
+        s.drop_media(m, TrackKind::Video, 0, 0);
+        let c = s.project().video_tracks[0].clips[0].id;
+        s.selection = vec![c];
+        for &a in &weird {
+            for &b in &weird {
+                s.speed_ramp(a, b, 8);
+                s.selection = s.project().video_tracks[0]
+                    .clips
+                    .iter()
+                    .map(|c| c.id)
+                    .take(1)
+                    .collect();
+                s.slideshow(a, b);
+                s.auto_duck(a as f32, b as f32);
+            }
+        }
+        for steps in [0usize, 1, 2, 1000] {
+            s.speed_ramp(1.0, 2.0, steps);
+            s.selection = s.project().video_tracks[0]
+                .clips
+                .iter()
+                .map(|c| c.id)
+                .take(1)
+                .collect();
+        }
+        // a timeline continua consistente: clipes em ordem, sem sobrepor
+        for t in s.project().all_tracks() {
+            for w in t.clips.windows(2) {
+                assert!(w[0].end() <= w[1].start, "{:?} {:?}", w[0].id, w[1].id);
+            }
+            assert!(
+                t.clips
+                    .iter()
+                    .all(|c| c.duration >= 1 && c.speed.is_finite() && c.speed > 0.0)
+            );
+        }
+        // estabilizar com movimentos absurdos
+        let r = crate::stabilize::Stabilization {
+            moves: vec![(f32::NAN, 1e30), (f32::INFINITY, -1e30), (3.0, 4.0)],
+            max_move: f32::NAN,
+        };
+        let c = s.project().video_tracks[0].clips[0].id;
+        s.apply_stabilization(c, &r);
+        let z = s.project().clip(c).unwrap().transform.scale;
+        assert!(z.is_finite() && (0.05..=10.0).contains(&z), "{z}");
+        s.apply_stabilization(
+            c,
+            &crate::stabilize::Stabilization {
+                moves: vec![],
+                max_move: 0.0,
+            },
+        );
+    }
+
+    #[test]
+    fn slideshow_lays_images_end_to_end_with_dissolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let imgs: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| paw_testkit::png(dir.path(), &format!("{n}.png"), "red", 64, 36))
+            .collect();
+        let mut s = state();
+        assert_eq!(s.slideshow(2.0, 0.5), 0, "sem imagens avisa");
+        assert_eq!(s.import(&imgs), 3);
+        assert_eq!(s.slideshow(2.0, 0.5), 3);
+        let clips = &s.project().video_tracks[0].clips;
+        assert_eq!(clips.len(), 3);
+        let fps = s.project().settings.fps;
+        let two_s = fps.seconds_to_frames(2.0);
+        assert!(clips.iter().all(|c| c.duration == two_s));
+        assert_eq!(clips[1].start, clips[0].end());
+        assert_eq!(clips[0].dissolve_in, 0, "o primeiro não tem dissolve");
+        assert_eq!(clips[1].dissolve_in, fps.seconds_to_frames(0.5));
+        assert_eq!(clips[2].dissolve_in, fps.seconds_to_frames(0.5));
+        // um desfazer por imagem nunca deixa o projeto num estado quebrado
+        for _ in 0..8 {
+            s.undo();
+        }
+        assert!(s.project().video_tracks.iter().all(|t| t.clips.is_empty()));
+    }
+
+    #[test]
+    fn auto_duck_lowers_the_music_only_while_the_voice_speaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let voice = paw_testkit::speech_with_pause(dir.path()); // fala 0–1 s, pausa 1–2 s, fala 2–3 s
+        let music = paw_testkit::dc_audio(dir.path(), "musica.wav", 0.3, 4.0);
+        let mut s = state();
+        assert_eq!(s.import(&[voice, music]), 2);
+        let (mv, mm) = (s.project().media[0].id, s.project().media[1].id);
+        s.drop_media(mv, TrackKind::Audio, 0, 0);
+        s.drop_media(mm, TrackKind::Audio, 1, 0);
+        let music_clip = s.project().audio_tracks[1].clips[0].id;
+        s.selection = vec![music_clip];
+        s.auto_duck(-40.0, 12.0);
+        let c = s.project().clip(music_clip).unwrap().clone();
+        let at = |frame: Frame| c.param(Param::VolumeDb, frame);
+        assert!((at(15) - -12.0).abs() < 0.5, "com voz: {}", at(15));
+        assert!(at(54).abs() < 0.5, "na pausa a música volta: {}", at(54));
+        assert!((at(75) - -12.0).abs() < 0.5, "voz de novo: {}", at(75));
+        assert!(at(110).abs() < 0.5, "depois da voz: {}", at(110));
+        // um desfazer tira todos os keyframes
+        s.undo();
+        assert!(
+            s.project()
+                .clip(music_clip)
+                .unwrap()
+                .keyframes
+                .get(&Param::VolumeDb)
+                .is_none_or(|k| k.is_empty())
+        );
+        // sem seleção avisa
+        s.selection.clear();
+        s.auto_duck(-40.0, 12.0);
+    }
+
+    #[test]
+    fn align_by_audio_moves_the_second_clip_to_match_the_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        // a mesma gravação; a segunda começa 0,5 s depois no som
+        let cam = paw_testkit::noise_audio(dir.path(), "cam.wav", 0.0, 8.0);
+        let mic = paw_testkit::noise_audio(dir.path(), "mic.wav", 0.5, 7.5);
+        let mut s = state();
+        assert_eq!(s.import(&[cam, mic]), 2);
+        let (m_cam, m_mic) = (s.project().media[0].id, s.project().media[1].id);
+        s.drop_media(m_cam, TrackKind::Audio, 0, 0);
+        s.drop_media(m_mic, TrackKind::Audio, 1, 300); // mic solto 10 s adiante, em outra faixa
+        let ids: Vec<_> = s
+            .project()
+            .all_tracks()
+            .flat_map(|t| t.clips.iter().map(|c| c.id))
+            .collect();
+        assert_eq!(ids.len(), 2);
+        let (cam_clip, mic_clip) = (
+            s.project().audio_tracks[0].clips[0].id,
+            s.project().audio_tracks[1].clips[0].id,
+        );
+        s.selection = vec![cam_clip, mic_clip];
+        s.align_selection_by_audio();
+        let start = s.project().clip(mic_clip).unwrap().start;
+        // o mic perdeu os primeiros 0,5 s do som, então ele deve ficar 0,5 s (15 frames) depois
+        assert!((start - 15).abs() <= 1, "começou em {start}");
+        // um desfazer volta
+        s.undo();
+        assert_eq!(s.project().clip(mic_clip).unwrap().start, 300);
+        // uma seleção só avisa e não mexe
+        s.selection = vec![cam_clip];
+        s.align_selection_by_audio();
+        assert_eq!(s.project().clip(mic_clip).unwrap().start, 300);
     }
 
     #[test]

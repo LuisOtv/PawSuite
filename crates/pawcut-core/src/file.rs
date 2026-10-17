@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::edit::MAX_FRAME;
 use crate::model::{PROJECT_VERSION, Project};
 use crate::time::Frame;
 
@@ -93,9 +94,40 @@ fn validate(p: &mut Project) -> Result<(), String> {
             return Err(format!("o id {id} aparece duas vezes"));
         }
     }
+    if s.width > 16384 || s.height > 16384 {
+        return Err("resolução maior que 16384".into());
+    }
+    if p.markers
+        .iter()
+        .any(|m| !(0..=MAX_FRAME).contains(&m.frame))
+    {
+        return Err("marcador fora da linha do tempo".into());
+    }
     for t in p.all_tracks() {
         let mut prev_end: Frame = 0;
         for c in &t.clips {
+            if !(0..=MAX_FRAME).contains(&c.start) || c.duration > MAX_FRAME {
+                return Err("clipe fora do intervalo aceito da linha do tempo".into());
+            }
+            if !(0..=MAX_FRAME).contains(&c.fade_in)
+                || !(0..=MAX_FRAME).contains(&c.fade_out)
+                || !(0..=MAX_FRAME).contains(&c.dissolve_in)
+            {
+                return Err("clipe com fade ou dissolve inválido".into());
+            }
+            if !c.volume_db.is_finite() || c.volume_db.abs() > 200.0 {
+                return Err("clipe com volume inválido".into());
+            }
+            if c.source_start.abs() > MAX_FRAME as f64 || c.freeze.is_some_and(|f| !f.is_finite()) {
+                return Err("clipe com ponto de fonte inválido".into());
+            }
+            if c.keyframes
+                .values()
+                .flatten()
+                .any(|k| !k.at.is_finite() || !k.value.is_finite())
+            {
+                return Err("clipe com keyframe inválido".into());
+            }
             if c.duration < 1 {
                 return Err("clipe com duração menor que 1 frame".into());
             }

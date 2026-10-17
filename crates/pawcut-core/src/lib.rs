@@ -17,9 +17,9 @@ pub use editor::Editor;
 pub use file::{ProjectFileError, from_json, load_project, save_project, to_json};
 pub use ids::{ClipId, LinkId, MediaId, TrackId};
 pub use model::{
-    ChromaKey, Clip, ClipSource, ColorAdjust, Crop, Ease, Keyframe, Marker, MediaInfo, MediaKind,
-    MediaRef, PROJECT_VERSION, Param, Project, ProjectSettings, Rgba, TextAlign, TextStyle, Track,
-    TrackKind, Transform,
+    AudioFx, ChromaKey, Clip, ClipSource, ColorAdjust, Crop, Ease, Keyframe, Marker, MediaInfo,
+    MediaKind, MediaRef, PROJECT_VERSION, Param, Project, ProjectSettings, Rgba, TextAlign,
+    TextStyle, Track, TrackKind, Transform, audio_fx_key,
 };
 pub use srt::{Cue, parse_subtitles, write_srt};
 pub use time::{Frame, FrameRate, format_timecode, parse_timecode};

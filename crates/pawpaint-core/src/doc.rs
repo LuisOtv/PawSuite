@@ -26,6 +26,9 @@ pub struct Layer {
     pub parent: Option<LayerId>,
     /// Só para pastas: mostrando as camadas de dentro na lista.
     pub expanded: bool,
+    /// Camada de ajuste: não tem pixels; aplica este filtro a tudo que está embaixo dela
+    /// (na mesma pasta), na força da opacidade e limitado pela máscara.
+    pub adjust: Option<crate::filters::Filter>,
 }
 
 impl Layer {
@@ -43,6 +46,7 @@ impl Layer {
             is_group: false,
             parent: None,
             expanded: true,
+            adjust: None,
         }
     }
 }

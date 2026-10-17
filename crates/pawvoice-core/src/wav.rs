@@ -48,6 +48,9 @@ pub fn read_wav_f32(path: &Path) -> io::Result<(Vec<f32>, u32, u16)> {
         let body = bytes.get(pos + 8..pos + 8 + len).ok_or_else(bad)?;
         match id {
             b"fmt " => {
+                if body.len() < 16 {
+                    return Err(bad());
+                }
                 let fmt = u16::from_le_bytes([body[0], body[1]]);
                 let channels = u16::from_le_bytes([body[2], body[3]]);
                 let bits = u16::from_le_bytes([body[14], body[15]]);

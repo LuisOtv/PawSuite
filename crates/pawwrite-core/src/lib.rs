@@ -268,17 +268,18 @@ pub fn to_srt(text: &str, wpm: f32, max_chars: usize) -> String {
             let dur = seconds(chunk.len(), wpm).max(0.8);
             // quebra em duas linhas perto do meio
             let text = chunk.join(" ");
-            let body = if text.len() > max_chars {
-                let mid = text.len() / 2;
-                let cut = text
-                    .char_indices()
-                    .filter(|(_, c)| *c == ' ')
-                    .map(|(k, _)| k)
-                    .min_by_key(|k| k.abs_diff(mid))
-                    .unwrap_or(mid);
-                format!("{}\n{}", &text[..cut], text[cut..].trim_start())
-            } else {
-                text
+            let mid = text.len() / 2;
+            // só quebra num espaço (uma palavra enorme sem espaço fica numa linha só)
+            let cut = text
+                .char_indices()
+                .filter(|(_, c)| *c == ' ')
+                .map(|(k, _)| k)
+                .min_by_key(|k| k.abs_diff(mid));
+            let body = match cut {
+                Some(cut) if text.len() > max_chars => {
+                    format!("{}\n{}", &text[..cut], text[cut..].trim_start())
+                }
+                _ => text,
             };
             n += 1;
             out.push_str(&format!(
@@ -297,6 +298,164 @@ pub fn to_srt(text: &str, wpm: f32, max_chars: usize) -> String {
 /// Tempo de fala de `words` palavras a `wpm` palavras por minuto, em segundos.
 pub fn seconds(words: usize, wpm: f32) -> f32 {
     words as f32 / wpm.max(1.0) * 60.0
+}
+
+/// O que o texto da fala diz sobre o jeito de falar: muletas, repetições, frases longas e o gancho.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Insights {
+    /// Muletas de fala e quantas vezes aparecem (as que aparecem pelo menos 3×), da maior à menor.
+    pub fillers: Vec<(String, usize)>,
+    /// Palavras (5 letras ou mais) que mais se repetem, da maior à menor.
+    pub repeated: Vec<(String, usize)>,
+    /// Frases com mais de 30 palavras: o começo delas e quantas palavras têm.
+    pub long_sentences: Vec<(String, usize)>,
+    /// Média de palavras por frase.
+    pub avg_sentence: f32,
+    /// O que é dito nos primeiros 30 s (o gancho do vídeo) e quantas palavras são.
+    pub hook: String,
+    pub hook_words: usize,
+}
+
+const FILLERS: [&str; 14] = [
+    "então",
+    "tipo",
+    "né",
+    "aí",
+    "assim",
+    "basicamente",
+    "praticamente",
+    "literalmente",
+    "cara",
+    "gente",
+    "enfim",
+    "tá",
+    "ok",
+    "ou seja",
+];
+
+fn normalize_word(w: &str) -> String {
+    w.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+}
+
+/// Analisa só a fala (títulos, notas e comentários ficam de fora).
+pub fn insights(text: &str, wpm: f32) -> Insights {
+    let speech = spoken(text);
+    let words: Vec<String> = speech
+        .split_whitespace()
+        .map(normalize_word)
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut out = Insights::default();
+    if words.is_empty() {
+        return out;
+    }
+    // muletas (inclui "ou seja", que são duas palavras)
+    let joined = format!(" {} ", words.join(" "));
+    for f in FILLERS {
+        let n = joined.matches(&format!(" {f} ")).count();
+        if n >= 3 {
+            out.fillers.push((f.to_string(), n));
+        }
+    }
+    out.fillers
+        .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // palavras que mais se repetem
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for w in &words {
+        if w.chars().count() >= 5 {
+            *counts.entry(w.as_str()).or_default() += 1;
+        }
+    }
+    let mut rep: Vec<(String, usize)> = counts
+        .into_iter()
+        .filter(|(_, n)| *n >= 4)
+        .map(|(w, n)| (w.to_string(), n))
+        .collect();
+    rep.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rep.truncate(8);
+    out.repeated = rep;
+    // frases
+    let sentences: Vec<&str> = speech
+        .split(['.', '!', '?', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let counts: Vec<usize> = sentences
+        .iter()
+        .map(|s| s.split_whitespace().count())
+        .collect();
+    out.avg_sentence = counts.iter().sum::<usize>() as f32 / counts.len().max(1) as f32;
+    for (s, n) in sentences.iter().zip(&counts) {
+        if *n > 30 {
+            let head: String = s.split_whitespace().take(8).collect::<Vec<_>>().join(" ");
+            out.long_sentences.push((format!("{head}…"), *n));
+        }
+    }
+    // gancho: as palavras que cabem em 30 s
+    let hook_words = ((wpm.clamp(40.0, 400.0) * 0.5) as usize).max(1);
+    let raw: Vec<&str> = speech.split_whitespace().collect();
+    out.hook_words = hook_words.min(raw.len());
+    out.hook = raw[..out.hook_words].join(" ");
+    out
+}
+
+/// Capítulos do YouTube a partir das seções do roteiro (títulos `#` e `##`), com o tempo de fala
+/// de cada uma ao ritmo `wpm`. O YouTube pede o primeiro em 00:00, pelo menos três capítulos e
+/// pelo menos 10 s cada um; quando o roteiro não dá isso, o erro diz o que falta.
+pub fn youtube_chapters(text: &str, wpm: f32) -> Result<String, String> {
+    let a = analyze(text);
+    let mut at = 0.0f32;
+    // (início, título)
+    let mut chapters: Vec<(f32, String)> = Vec::new();
+    for s in &a.sections {
+        if s.level == 0 {
+            // a abertura antes do primeiro título só vira capítulo se tiver fala
+            if s.words > 0 {
+                chapters.push((at, "Introdução".to_string()));
+            }
+        } else if s.level <= 2 {
+            chapters.push((at, s.title.trim().to_string()));
+        }
+        at += seconds(s.words, wpm);
+    }
+    let total = at;
+    if chapters.is_empty() {
+        return Err("O roteiro não tem títulos (# Título) para virar capítulos".into());
+    }
+    // o primeiro capítulo começa em 0 mesmo que haja falas antes dele
+    chapters[0].0 = 0.0;
+    if chapters.len() < 3 {
+        return Err(format!(
+            "O YouTube pede pelo menos 3 capítulos e o roteiro tem {}",
+            chapters.len()
+        ));
+    }
+    for (i, (start, title)) in chapters.iter().enumerate() {
+        let end = chapters.get(i + 1).map_or(total, |c| c.0);
+        if end - start < 10.0 {
+            return Err(format!(
+                "O capítulo “{title}” dura só {:.0} s (o YouTube pede 10 s ou mais)",
+                (end - start).max(0.0)
+            ));
+        }
+    }
+    Ok(chapters
+        .iter()
+        .map(|(t, title)| format!("{} {}", chapter_time(*t), title))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// `00:00`, `07:05` ou `1:02:03`.
+fn chapter_time(secs: f32) -> String {
+    let t = secs.round().max(0.0) as u64;
+    let (h, m, s) = (t / 3600, t / 60 % 60, t % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
 }
 
 /// "45 s", "3 min 20 s", "1 h 05 min".
@@ -523,5 +682,98 @@ mod tests {
             "trocar ficou lento: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn youtube_chapters_follow_the_spoken_time() {
+        // 150 palavras por minuto: 25 palavras = 10 s
+        let words = |n: usize| vec!["palavra"; n].join(" ");
+        let script = format!(
+            "{}\n# Primeiro\n{}\n[B-roll: nota não conta]\n## Segundo\n{}\n# Terceiro\n{}",
+            words(75),
+            words(150),
+            words(300),
+            words(75)
+        );
+        let out = youtube_chapters(&script, 150.0).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "00:00 Introdução",
+                "00:30 Primeiro",
+                "01:30 Segundo",
+                "03:30 Terceiro"
+            ]
+        );
+        // sem abertura, o primeiro título vira 00:00
+        let script = format!("# A\n{}\n# B\n{}\n# C\n{}", words(50), words(50), words(50));
+        let out = youtube_chapters(&script, 150.0).unwrap();
+        assert!(out.starts_with("00:00 A\n00:20 B\n00:40 C"), "{out}");
+        // poucos capítulos, capítulo curto demais e roteiro sem título explicam o problema
+        assert!(
+            youtube_chapters(&format!("# A\n{}\n# B\n{}", words(50), words(50)), 150.0)
+                .unwrap_err()
+                .contains("pelo menos 3")
+        );
+        let err = youtube_chapters(
+            &format!("# A\n{}\n# B\n{}\n# C\n{}", words(50), words(5), words(50)),
+            150.0,
+        )
+        .unwrap_err();
+        assert!(err.contains("“B”") && err.contains("10 s"), "{err}");
+        assert!(
+            youtube_chapters("só fala", 150.0)
+                .unwrap_err()
+                .contains("pelo menos 3")
+        );
+        assert!(youtube_chapters("", 150.0).unwrap_err().contains("títulos"));
+        // mais de uma hora usa h:mm:ss
+        let long = format!(
+            "# A\n{}\n# B\n{}\n# C\n{}",
+            words(9000),
+            words(150),
+            words(150)
+        );
+        assert!(
+            youtube_chapters(&long, 150.0)
+                .unwrap()
+                .contains("1:00:00 B")
+        );
+        // ritmo absurdo não quebra
+        let _ = youtube_chapters(&script, 0.0);
+        let _ = youtube_chapters(&script, f32::NAN);
+    }
+
+    #[test]
+    fn insights_find_fillers_repetitions_long_sentences_and_the_hook() {
+        let text = "# Título que não conta\n[B-roll: então então então então]\n// tipo tipo tipo\n\
+            Então, hoje eu vou mostrar tipo como fazer um vídeo. Então a gente começa, né? Tipo assim, \
+            então tipo cara é simples. Câmera câmera câmera câmera câmera é importante. \
+            Esta frase é bem longa e continua sem parar para respirar nunca mais e segue falando de novo e \
+            de novo até passar de trinta palavras porque alguém esqueceu de pôr ponto final em lugar nenhum.";
+        let i = insights(text, 150.0);
+        // notas e comentários não entram na contagem
+        let ent = i.fillers.iter().find(|(w, _)| w == "então").map(|f| f.1);
+        assert_eq!(ent, Some(3), "{:?}", i.fillers);
+        assert!(i.fillers.iter().any(|(w, n)| w == "tipo" && *n == 3));
+        assert_eq!(
+            i.repeated.first().map(|r| (r.0.as_str(), r.1)),
+            Some(("câmera", 5))
+        );
+        assert_eq!(i.long_sentences.len(), 1);
+        assert!(
+            i.long_sentences[0].0.starts_with("Esta frase é bem longa"),
+            "{:?}",
+            i.long_sentences
+        );
+        assert!(i.avg_sentence > 5.0);
+        // 150 ppm → 75 palavras em 30 s; o texto tem menos, então o gancho é tudo
+        assert_eq!(i.hook_words, i.hook.split_whitespace().count());
+        assert!(i.hook.starts_with("Então, hoje"));
+        // texto curto e vazio não quebram
+        assert_eq!(insights("", 150.0), Insights::default());
+        assert!(insights("# só título", 150.0).hook.is_empty());
+        let _ = insights("a b c", f32::NAN);
     }
 }

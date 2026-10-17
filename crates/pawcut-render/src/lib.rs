@@ -1,7 +1,9 @@
 //! Compositor do PawCut: transforma a timeline em imagem e som.
 //! É o mesmo código para o preview e para a exportação, então o MP4 sai igual ao que se vê.
 
+mod audiofx;
 mod compose;
+pub use audiofx::process_audio_fx;
 pub use compose::{blurred, letterbox_blur};
 mod layout;
 mod mix;
@@ -250,7 +252,13 @@ impl Renderer {
         let media = &mut self.media;
         mix::mix(
             project,
-            &mut |p, speed| media.audio(p, speed).ok(),
+            &mut |p, speed, fx| {
+                media
+                    .audio_variant(p, speed, pawcut_core::audio_fx_key(fx), |pcm| {
+                        audiofx::process_audio_fx(pcm, fx)
+                    })
+                    .ok()
+            },
             start,
             frames,
         )
@@ -262,7 +270,9 @@ impl Renderer {
         let media = &mut self.media;
         mix::mix(
             project,
-            &mut |p, speed| media.resident_audio(p, speed),
+            &mut |p, speed, fx| {
+                media.resident_audio_variant(p, speed, pawcut_core::audio_fx_key(fx))
+            },
             start,
             frames,
         )

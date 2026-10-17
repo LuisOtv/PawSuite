@@ -6,6 +6,11 @@ use std::sync::Arc;
 use paw_media::Pcm;
 use pawcut_core::{Clip, ClipSource, Frame, Param, Project};
 
+/// Entrega o áudio de um arquivo na velocidade pedida, já com os efeitos do clipe (`None` pula
+/// o clipe).
+pub(crate) type AudioSource<'a> =
+    dyn FnMut(&Path, f64, &[pawcut_core::AudioFx]) -> Option<Arc<Pcm>> + 'a;
+
 /// Janela `[início, fim)` em frames.
 type Window = Option<(Frame, Frame)>;
 
@@ -29,7 +34,7 @@ fn audible(clips: &[Clip], i: usize) -> (Frame, Frame, Window, Window) {
 /// `audio(caminho, velocidade)` entrega o PCM de um arquivo, ou `None` para pular o clipe.
 pub(crate) fn mix(
     project: &Project,
-    audio: &mut dyn FnMut(&Path, f64) -> Option<Arc<Pcm>>,
+    audio: &mut AudioSource,
     start: i64,
     frames: usize,
 ) -> Vec<f32> {
@@ -65,7 +70,7 @@ pub(crate) fn mix(
             let Some(m) = project.media(*id) else {
                 continue;
             };
-            let Some(pcm) = audio(&m.info.path, clip.speed) else {
+            let Some(pcm) = audio(&m.info.path, clip.speed, &clip.audio_fx) else {
                 continue;
             };
             let s0 = to_sample(clip.start);

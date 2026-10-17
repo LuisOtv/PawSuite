@@ -255,3 +255,25 @@ fn non_finite_values_are_rejected() {
     });
     assert!(matches!(changed, Err(EditError::InvalidValue(_))));
 }
+
+#[test]
+fn project_notes_are_undoable_and_saved() {
+    let mut ed = new_editor();
+    assert_eq!(
+        ed.apply(Edit::SetNotes(String::new())),
+        Err(EditError::NoChange)
+    );
+    ed.apply(Edit::SetNotes("pegar b-roll da praia".into()))
+        .unwrap();
+    assert_eq!(ed.project().notes, "pegar b-roll da praia");
+    assert_eq!(ed.undo_label(), Some("Notas do projeto"));
+    let back = from_json(&to_json(ed.project()).unwrap()).unwrap();
+    assert_eq!(back.notes, "pegar b-roll da praia");
+    assert!(ed.undo());
+    assert!(ed.project().notes.is_empty());
+    // arquivo antigo, sem o campo, abre com notas vazias
+    let mut v: serde_json::Value = serde_json::from_str(&to_json(ed.project()).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("notes");
+    let old = from_json(&v.to_string()).unwrap();
+    assert!(old.notes.is_empty());
+}

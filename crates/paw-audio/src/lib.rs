@@ -3,5 +3,7 @@
 
 pub mod devices;
 pub mod dsp;
+pub mod fx;
 pub mod io;
 pub mod mix;
+pub mod whisper;

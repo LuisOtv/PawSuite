@@ -8,6 +8,8 @@ mod file_dialog;
 mod keymap;
 mod layout;
 mod panels;
+mod presets;
+mod stabilize;
 mod state;
 #[cfg(test)]
 mod ui_tests;
@@ -18,6 +20,7 @@ use paw_ui::{icons, theme};
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
+    paw_ui::isolate_screenshot_run("PAWCUT_SCREENSHOT");
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -34,6 +37,7 @@ fn main() -> eframe::Result {
                 builder.with_x11();
             }
         })),
+        wgpu_options: paw_ui::low_latency_wgpu(),
         ..Default::default()
     };
     eframe::run_native(

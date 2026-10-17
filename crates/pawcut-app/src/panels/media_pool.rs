@@ -469,6 +469,27 @@ impl Workspace {
         }
     }
 
+    /// Anotações livres do projeto, salvas junto com ele (e desfazíveis).
+    pub fn notes_ui(&mut self, ui: &mut egui::Ui) {
+        let mut text = self.st.project().notes.clone();
+        let w = ui.available_width() - 2.0 * theme::PAD;
+        ui.add_space(theme::PAD);
+        ui.horizontal(|ui| {
+            ui.add_space(theme::PAD);
+            let r = ui.add_sized(
+                [w.max(40.0), (ui.available_height() - theme::PAD).max(60.0)],
+                egui::TextEdit::multiline(&mut text).hint_text("Roteiro, pendências, créditos…"),
+            );
+            if r.changed() {
+                self.st
+                    .apply_coalescing(pawcut_core::Edit::SetNotes(text), "notes");
+            }
+            if r.lost_focus() {
+                self.st.editor.end_coalescing();
+            }
+        });
+    }
+
     pub fn effects_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(theme::PAD);
         ui.indent("toolbox", |ui| {
