@@ -36,6 +36,7 @@ fn main() -> eframe::Result {
                 builder.with_x11();
             }
         })),
+        wgpu_options: paw_ui::low_latency_wgpu(),
         ..Default::default()
     };
     eframe::run_native(

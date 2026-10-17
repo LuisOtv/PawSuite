@@ -5533,6 +5533,40 @@ mod tests {
         }
     }
 
+    /// Medição (não é teste de verdade): `cargo test --release -p pawvoice-app frame_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn frame_cost_with_a_dialog_open() {
+        let n = 48_000 * 60 * 5;
+        let (mut app, _) = app_with((0..n).map(|i| (i as f32 * 0.01).sin() * 0.3).collect());
+        app.dialog = Some(Dialog::Fx(crate::fx_dialogs::FxDialog::equalizer()));
+        let ctx = egui::Context::default();
+        let mut times = Vec::new();
+        for i in 0..80 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1480.0, 880.0))),
+                events: vec![egui::Event::PointerMoved(pos2(300.0 + i as f32, 200.0))],
+                ..Default::default()
+            };
+            let t = std::time::Instant::now();
+            ctx.run_ui(raw, |ui| {
+                app.frame(ui);
+                let c = ui.ctx().clone();
+                app.dialogs(&c);
+            })
+            .drop_without_applying_deltas();
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(|a, b| a.total_cmp(b));
+        eprintln!(
+            "frame ms: min {:.2} mediana {:.2} p90 {:.2} max {:.2}",
+            times[0],
+            times[times.len() / 2],
+            times[times.len() * 9 / 10],
+            times[times.len() - 1]
+        );
+    }
+
     #[test]
     fn transcription_turns_speech_into_labels() {
         let (mut app, _) = app_with(vec![0.1; 48_000 * 4]);
