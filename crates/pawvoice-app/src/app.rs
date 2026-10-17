@@ -2774,16 +2774,14 @@ impl VoiceApp {
                 self.tool = Tool::Envelope;
             }
             sep(ui);
-            let (g, _) = ui.allocate_exact_size(vec2(18.0, 28.0), Sense::hover());
-            icons::paint(
-                ui.painter(),
-                Rect::from_center_size(g.center(), vec2(16.0, 16.0)),
+            let gear = icons::button(
+                ui,
                 Icon::Gear,
-                theme::TEXT,
+                16.0,
+                false,
+                "Configuração de áudio: microfone, canais de gravação (mono/estéreo) e saída",
             );
-            ui.menu_button("Configuração de áudio", |ui| self.audio_setup_menu(ui))
-                .response
-                .on_hover_text("Microfone, canais de gravação (mono/estéreo) e saída");
+            egui::Popup::menu(&gear).show(|ui| self.audio_setup_menu(ui));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 self.meters(ui);

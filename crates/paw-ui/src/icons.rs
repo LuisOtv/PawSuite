@@ -102,6 +102,9 @@ pub enum Icon {
     Reset,
     Wheel,
     Check,
+    /// Marcar entrada / saída (colchetes).
+    MarkIn,
+    MarkOut,
 }
 
 impl Icon {
@@ -192,6 +195,8 @@ impl Icon {
         Icon::Reset,
         Icon::Wheel,
         Icon::Check,
+        Icon::MarkIn,
+        Icon::MarkOut,
     ];
 }
 
@@ -860,6 +865,20 @@ pub fn paint(painter: &Painter, r: Rect, icon: Icon, c: Color32) {
             if icon == Icon::ZoomIn {
                 pen.line(10.5, 7.5, 10.5, 13.5);
             }
+        }
+        Icon::MarkIn | Icon::MarkOut => {
+            // colchete com uma setinha apontando para dentro
+            let (x, dir) = if icon == Icon::MarkIn {
+                (7.0, 1.0)
+            } else {
+                (17.0, -1.0)
+            };
+            pen.line(x, 4.0, x, 20.0);
+            pen.line(x, 4.0, x + 4.0 * dir, 4.0);
+            pen.line(x, 20.0, x + 4.0 * dir, 20.0);
+            pen.line(x + 3.0 * dir, 12.0, x + 9.0 * dir, 12.0);
+            pen.line(x + 6.5 * dir, 9.0, x + 9.0 * dir, 12.0);
+            pen.line(x + 6.5 * dir, 15.0, x + 9.0 * dir, 12.0);
         }
         Icon::Gear => {
             let pts: Vec<(f32, f32)> = (0..32)

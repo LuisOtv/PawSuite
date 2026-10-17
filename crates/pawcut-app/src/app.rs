@@ -367,11 +367,19 @@ impl PawCutApp {
                 if icons::button(ui, icon, 15.0, on, label).clicked() {
                     self.toggle_panel(panel);
                 }
-                ui.label(egui::RichText::new(label).size(11.5).color(if on {
+                let text = egui::RichText::new(label).size(11.5).color(if on {
                     theme::TEXT
                 } else {
                     theme::TEXT_DIM
-                }));
+                });
+                // o nome ao lado do ícone também liga e desliga o painel
+                if ui
+                    .add(egui::Label::new(text).sense(egui::Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.toggle_panel(panel);
+                }
                 ui.add_space(10.0);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

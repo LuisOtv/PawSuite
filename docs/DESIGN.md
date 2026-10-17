@@ -230,6 +230,11 @@ Blender:
 - **Botão direito** abre o que se faz com aquilo (menu de contexto), nunca é o único caminho.
 - **Arrastar e soltar** arquivos na janela importa/abre.
 - **Cursor do mouse** diz o que vai acontecer (redimensionar, texto, mão).
+- **Botão de barra é ícone, não texto.** Em toolbar e barra de transporte, o que cabe num ícone
+  (`paw_ui::icons::button`) é ícone, com a explicação na dica. Um ícone ao lado de um botão de
+  texto que faz a mesma coisa é bug: vira um só, o ícone, e o clique faz a ação (foi o caso da
+  engrenagem solta ao lado de "Configuração de áudio"). Texto só quando não existe ícone claro
+  ou a ação precisa de uma palavra para não ser confundida.
 - **Feedback imediato.** Todo clique tem resposta na mesma tela (< 100 ms). Se a operação é
   mais lenta, mostre progresso e permita cancelar.
 
@@ -403,6 +408,7 @@ zero.
 - [ ] Só usa cores e medidas de `paw_ui::theme`.
 - [ ] Barras e linhas usam `toolbar`, `section` e `row`.
 - [ ] Todo botão de ícone tem dica com o atalho.
+- [ ] Nenhum botão de texto numa barra onde um ícone resolve; nenhum ícone decorativo que não clica.
 - [ ] Todo campo tem largura fixa (ou `fit_width`), `range` e sufixo.
 - [ ] Nenhum campo muda de tamanho ao arrastar ou digitar, nem em painel estreito.
 - [ ] Com um campo de texto em foco, os atalhos não disparam.
